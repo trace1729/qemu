@@ -16,6 +16,7 @@
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
+// Global variables
 typedef struct TraceInstruction {
 	uint64_t instr_pc_va;
 	uint64_t instr_pc_pa;
@@ -34,68 +35,191 @@ typedef struct TraceInstruction {
 	uint8_t taken;
 	uint8_t exception;
 } TraceInstruction;
+// static const char* outfile = "tracefile.zst";
+static uint64_t max_inst = 500; // default max instructions to trace
 
-typedef struct VCPUState {
-	uint64_t last_pc; // 上一条指令PC
-	TraceInstruction* current; // 当前正在处理的记录
-} VCPUState;
-
+/*
+ * CONTROL FLOW */
+/* We use this to track the current execution state */
 typedef struct {
-	GArray* vcpu_states; // 每个vCPU的状态数组
-	GRWLock state_lock; // 状态访问锁
-	FILE* output_file; // 输出文件
-	GMutex output_lock; // 输出锁
-	uint64_t trace_count; // 总跟踪数量
-} GlobalState;
+	/* address of current translated block */
+	uint64_t tb_pc;
+	/* address of end of block */
+	uint64_t end_block;
+	/* next pc after end of block */
+	uint64_t pc_after_block;
+	/* address of last executed PC */
+	uint64_t last_pc;
+} VCPUScoreBoard;
+// 用来跟踪当前 cpu 的运行状态
 
-// Global variables
-static const char* outfile = "tracefile.zst";
-static uint64_t max_inst = 500;
-static FILE* out_fp = NULL;
-static ZSTD_CCtx* cctx = NULL;
-static uint64_t n_traced = 0;
+static qemu_plugin_u64 tb_pc;
+static qemu_plugin_u64 end_block;
+static qemu_plugin_u64 pc_after_block;
+static qemu_plugin_u64 last_pc;
+// handle for Scoreboard
 
-// locks for thread safety
-static GMutex trace_buffer_lock;
+struct qemu_plugin_scoreboard* state; // handle for manipulating the socreboard
 
-static void plugin_init(void) { return; }
+/*
+ * instruction meta_data */
+typedef struct CPU {
+	/* Store last executed instruction on each vCPU as a GString */
+	TraceInstruction last_inst;
+} CPU;
+
+// 该数组保存了每一个cpu的运行状态
+static GArray* cpus;
+// 保护 cpus 数组读写的 线程安全
+static GRWLock expand_array_lock;
+
+static void plugin_init(void)
+{
+	state = qemu_plugin_scoreboard_new(sizeof(VCPUScoreBoard));
+
+	/* score board declarations */
+	tb_pc = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, tb_pc);
+	end_block = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, end_block);
+	pc_after_block = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, pc_after_block);
+	last_pc = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, last_pc);
+	return;
+}
+
+static CPU* get_cpu(int cpu_index)
+{
+	CPU* c;
+	g_rw_lock_reader_lock(&expand_array_lock);
+	c = &g_array_index(cpus, CPU, cpu_index);
+	g_rw_lock_reader_unlock(&expand_array_lock);
+
+	return c;
+}
+
+static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int vcpu_index)
+{
+	CPU* c;
+
+	g_rw_lock_writer_lock(&expand_array_lock);
+	// If the current cpu index is larger than the size of cpus array, expand it
+	if (vcpu_index >= cpus->len) {
+		g_array_set_size(cpus, vcpu_index + 1);
+	}
+	g_rw_lock_writer_unlock(&expand_array_lock);
+
+	c = get_cpu(vcpu_index);
+	c->last_inst = (TraceInstruction) { 0 };
+}
 
 /********************  Memory callback  ********************/
-static void mem_cb(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void* userdata) {
+static void mem_cb(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void* userdata)
+{
+	CPU* c = get_cpu(vcpu);
+	if (qemu_plugin_mem_is_store(info)) {
+		c->last_inst.memory_type = 1; // store
+	} else {
+		c->last_inst.memory_type = 0; // load
+	}
+	c->last_inst.memory_size = qemu_plugin_mem_size_shift(info);
+	c->last_inst.exu_data.memory_address = vaddr;
 }
 
 /********************  Instruction execution callback  ********************/
-static void insn_exec_cb(unsigned int vcpu, void* userdata) { }
+static void insn_exec_cb(unsigned int vcpu, void* userdata)
+{
+	// using qemu_plugin_outs to print last_inst, and initialize a new last_inst
+	CPU* c = get_cpu(vcpu);
+	char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64,
+		c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
+		c->last_inst.target);
+	qemu_plugin_outs(output);
+	qemu_plugin_outs("\n");
+
+	// reset last_inst
+	c->last_inst = *(TraceInstruction*)userdata;
+}
+
+static void vcpu_tb_branched_exec(unsigned int cpu_index, void* udata)
+{
+	uint64_t lpc = qemu_plugin_u64_get(last_pc, cpu_index);
+	uint64_t ebpc = qemu_plugin_u64_get(end_block, cpu_index);
+	uint64_t pc = qemu_plugin_u64_get(tb_pc, cpu_index);
+
+	CPU* c = get_cpu(cpu_index);
+	if (lpc != ebpc) {
+		c->last_inst.exception = 1; // mark exception
+	} else {
+		c->last_inst.taken = 1; // mark taken branch
+		c->last_inst.target = pc;
+	}
+}
 
 /********************  TB translation callback  ********************/
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb* tb)
 {
-	size_t n_insns = qemu_plugin_tb_n_insns(tb);
+	uint64_t pc = qemu_plugin_tb_vaddr(tb);
+	size_t insns = qemu_plugin_tb_n_insns(tb);
+	struct qemu_plugin_insn* first_insn = qemu_plugin_tb_get_insn(tb, 0);
+	struct qemu_plugin_insn* last_insn = qemu_plugin_tb_get_insn(tb, insns - 1);
 
+	/*
+	 * check if we are executing linearly after the last block. We can
+	 * handle both early block exits and normal branches in the
+	 * callback if we hit it.
+	 */
+
+	// update the pc for current block
+	qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(tb, QEMU_PLUGIN_INLINE_STORE_U64, tb_pc, pc);
+	// based on the pc_after_block and current pc to determine if there is a branch or an early exit
+	qemu_plugin_register_vcpu_tb_exec_cond_cb(tb, vcpu_tb_branched_exec, QEMU_PLUGIN_CB_NO_REGS,
+		QEMU_PLUGIN_COND_NE, pc_after_block, pc, NULL);
+
+	// update the end_block and pc_after_block for the current block
+	qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+		first_insn, QEMU_PLUGIN_INLINE_STORE_U64, end_block, qemu_plugin_insn_vaddr(last_insn));
+	qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(first_insn, QEMU_PLUGIN_INLINE_STORE_U64,
+		pc_after_block, qemu_plugin_insn_vaddr(last_insn) + qemu_plugin_insn_size(last_insn));
+
+	/**
+	 * After operations on block level, we can now register callbacks on instruction level
+	 *
+	 */
+	size_t n_insns = qemu_plugin_tb_n_insns(tb);
 	for (size_t i = 0; i < n_insns; i++) {
 		struct qemu_plugin_insn* insn = qemu_plugin_tb_get_insn(tb, i);
+		uint64_t ipc = qemu_plugin_insn_vaddr(insn);
+		TraceInstruction userdata = { 0 };
+		userdata.instr_pc_va = ipc;
+		// qemu_plugin_insn_data(insn, &userdata.instr, sizeof(userdata.instr));
+		// register instruction execution callback
 
-		// TODO leave for later
-		TraceInstruction* rec = NULL;
-
-		// Get instruction bytes
-		qemu_plugin_insn_data(insn, &rec->instr, sizeof(rec->instr));
-
-		// Register memory callback for load/store instructions
-		qemu_plugin_register_vcpu_insn_exec_cb(insn, insn_exec_cb, QEMU_PLUGIN_CB_NO_REGS, rec);
+		// ok all the data for the current instruction is ready
+		// register memory access callback
 		qemu_plugin_register_vcpu_mem_cb(
-			insn, mem_cb, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_RW, rec);
+			insn, mem_cb, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_RW, NULL);
+
+		// then we pass the information by execution callback
+		qemu_plugin_register_vcpu_insn_exec_cb(
+			insn, insn_exec_cb, QEMU_PLUGIN_CB_NO_REGS, &userdata);
+
+		// executed instruction (exception can happens)
+		// since we do not know whether the current inst will cause exception or not
+		// we register the last_pc update on every instruction
+		qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+			insn, QEMU_PLUGIN_INLINE_STORE_U64, last_pc, ipc);
 	}
 }
 
 /********************  Plugin lifecycle callbacks  ********************/
 static void exit_cb(qemu_plugin_id_t id, void* userdata) { }
 
+// shared by all cpus
 /********************  Plugin install  ********************/
 QEMU_PLUGIN_EXPORT
 int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t* info, int argc, char** argv)
 {
 
+	cpus = g_array_sized_new(
+		true, true, sizeof(CPU), info->system_emulation ? info->system.max_vcpus : 1);
 	for (int i = 0; i < argc; i++) {
 		char* opt = argv[i];
 		// g_auto means automatic cleanup for declared type, like RALL in c++
@@ -110,7 +234,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t* info, int argc, 
 		}
 	}
 
+	// initialize static and global variables (visible to all threads(cpus))
 	plugin_init();
+
+	// initialize the variable that is local to each thread(cpu)
+	qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
 
 	qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
 	qemu_plugin_register_atexit_cb(id, exit_cb, NULL);
