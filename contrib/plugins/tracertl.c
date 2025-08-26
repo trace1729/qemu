@@ -135,7 +135,8 @@ static void insn_exec_cb(unsigned int vcpu, void* userdata)
 	qemu_plugin_outs("\n");
 
 	// reset last_inst
-	c->last_inst = *(TraceInstruction*)userdata;
+	TraceInstruction* data = (TraceInstruction*)userdata;
+	c->last_inst = *data;
 }
 
 static void vcpu_tb_branched_exec(unsigned int cpu_index, void* udata)
@@ -187,9 +188,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb* tb)
 	for (size_t i = 0; i < n_insns; i++) {
 		struct qemu_plugin_insn* insn = qemu_plugin_tb_get_insn(tb, i);
 		uint64_t ipc = qemu_plugin_insn_vaddr(insn);
-		TraceInstruction userdata = { 0 };
-		userdata.instr_pc_va = ipc;
-		// qemu_plugin_insn_data(insn, &userdata.instr, sizeof(userdata.instr));
+		TraceInstruction* userdata = g_new0(TraceInstruction, 1);
+		uint32_t opcode;
+		qemu_plugin_insn_data(insn, &opcode, sizeof(opcode));
+		userdata->instr = opcode;
+		userdata->instr_pc_pa = ipc;
+		userdata->instr_pc_va = ipc;
 		// register instruction execution callback
 
 		// ok all the data for the current instruction is ready
@@ -199,7 +203,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb* tb)
 
 		// then we pass the information by execution callback
 		qemu_plugin_register_vcpu_insn_exec_cb(
-			insn, insn_exec_cb, QEMU_PLUGIN_CB_NO_REGS, &userdata);
+			insn, insn_exec_cb, QEMU_PLUGIN_CB_NO_REGS, userdata);
 
 		// executed instruction (exception can happens)
 		// since we do not know whether the current inst will cause exception or not
