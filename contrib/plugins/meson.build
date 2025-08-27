@@ -1,5 +1,5 @@
 contrib_plugins = ['bbv', 'cache', 'cflow', 'drcov', 'execlog', 'hotblocks',
-                   'hotpages', 'howvec', 'hwprofile', 'ips', 'stoptrigger', 'tracertl']
+                   'hotpages', 'howvec', 'hwprofile', 'ips', 'stoptrigger', 'tracertl', 'ipsv2']
 if host_os != 'windows'
   # lockstep uses socket.h
   contrib_plugins += 'lockstep'

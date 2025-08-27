@@ -184,13 +184,13 @@ static void vcpu_insn_exec(unsigned int vcpu, void* userdata)
 {
 	// using qemu_plugin_outs to print last_inst, and initialize a new last_inst
 	CPU* c = get_cpu(vcpu);
-    // if (c->valid) {
-    //     char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64,
-	// 	c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
-	// 	c->last_inst.target);
-	//     qemu_plugin_outs(output);
-	//     qemu_plugin_outs("\n");
-    // }
+    if (c->valid) {
+        char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64,
+		c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
+		c->last_inst.target);
+	    qemu_plugin_outs(output);
+	    qemu_plugin_outs("\n");
+    }
 	
 	// reset last_inst
 	TraceInstruction* data = (TraceInstruction*)userdata;
