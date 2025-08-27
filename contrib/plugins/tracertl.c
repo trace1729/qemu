@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <zstd.h>
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -66,6 +67,7 @@ struct qemu_plugin_scoreboard* state; // handle for manipulating the socreboard
 typedef struct CPU {
 	/* Store last executed instruction on each vCPU as a GString */
 	TraceInstruction last_inst;
+    bool valid;
 } CPU;
 
 // 该数组保存了每一个cpu的运行状态
@@ -73,17 +75,18 @@ static GArray* cpus;
 // 保护 cpus 数组读写的 线程安全
 static GRWLock expand_array_lock;
 
-static void plugin_init(void)
-{
-	state = qemu_plugin_scoreboard_new(sizeof(VCPUScoreBoard));
 
-	/* score board declarations */
-	tb_pc = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, tb_pc);
-	end_block = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, end_block);
-	pc_after_block = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, pc_after_block);
-	last_pc = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, last_pc);
-	return;
-}
+/**
+    IPC datastructure
+*/
+typedef struct {
+    uint64_t total_insn;
+    uint64_t elapesd_time;
+} vCPUTime;
+
+struct qemu_plugin_scoreboard* cpu_time;
+#define USEC_IN_ONE_SEC (1000 * 1000)
+
 
 static CPU* get_cpu(int cpu_index)
 {
@@ -95,9 +98,50 @@ static CPU* get_cpu(int cpu_index)
 	return c;
 }
 
-static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int vcpu_index)
+static void plugin_init(void)
+{
+	state = qemu_plugin_scoreboard_new(sizeof(VCPUScoreBoard));
+    cpu_time = qemu_plugin_scoreboard_new(sizeof(vCPUTime));
+
+	/* score board declarations */
+	tb_pc = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, tb_pc);
+	end_block = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, end_block);
+	pc_after_block = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, pc_after_block);
+	last_pc = qemu_plugin_scoreboard_u64_in_struct(state, VCPUScoreBoard, last_pc);
+	return;
+}
+
+
+/********************  Plugin lifecycle callbacks  ********************/
+static void plugin_exit(qemu_plugin_id_t id, void* userdata) { 
+    guint i;
+    g_rw_lock_reader_lock(&expand_array_lock);
+    for (i = 0; i < cpus->len; i++) {
+        CPU *c = get_cpu(i);
+        char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64,
+        c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
+        c->last_inst.target);
+        qemu_plugin_outs(output);
+        qemu_plugin_outs("\n");
+
+        vCPUTime *local_cpu_time = qemu_plugin_scoreboard_find(cpu_time, i);
+
+        uint64_t time_secs = (g_get_real_time() - local_cpu_time->elapesd_time) / USEC_IN_ONE_SEC;
+        output = g_strdup_printf("elapsed_time %" PRIdPTR ", total instruction %" PRIdPTR ", ips:%f", time_secs, local_cpu_time->total_insn,  (local_cpu_time->total_insn) * 1.0 / time_secs);
+
+        qemu_plugin_outs(output);
+        qemu_plugin_outs("\n");
+     
+    }
+    g_rw_lock_reader_unlock(&expand_array_lock);
+}
+
+
+static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index)
 {
 	CPU* c;
+    
+    qemu_plugin_outs("vcpu_init================");
 
 	g_rw_lock_writer_lock(&expand_array_lock);
 	// If the current cpu index is larger than the size of cpus array, expand it
@@ -108,10 +152,22 @@ static void vcpu_init_cb(qemu_plugin_id_t id, unsigned int vcpu_index)
 
 	c = get_cpu(vcpu_index);
 	c->last_inst = (TraceInstruction) { 0 };
+    c-> valid = false;
+
+    vCPUTime * local_cpu_time = qemu_plugin_scoreboard_find(cpu_time, vcpu_index);
+    local_cpu_time->elapesd_time = g_get_real_time();
+    uint64_t start_time = local_cpu_time->elapesd_time / USEC_IN_ONE_SEC;
+    char* output = g_strdup_printf("elapsed_time %" PRIdPTR ", total instruction %" PRIdPTR, start_time, local_cpu_time->total_insn);
+
+    qemu_plugin_outs(output);
+    qemu_plugin_outs("\n");
+
 }
 
+
+
 /********************  Memory callback  ********************/
-static void mem_cb(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void* userdata)
+static void vcpu_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void* userdata)
 {
 	CPU* c = get_cpu(vcpu);
 	if (qemu_plugin_mem_is_store(info)) {
@@ -124,19 +180,22 @@ static void mem_cb(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr
 }
 
 /********************  Instruction execution callback  ********************/
-static void insn_exec_cb(unsigned int vcpu, void* userdata)
+static void vcpu_insn_exec(unsigned int vcpu, void* userdata)
 {
 	// using qemu_plugin_outs to print last_inst, and initialize a new last_inst
 	CPU* c = get_cpu(vcpu);
-	char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64,
-		c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
-		c->last_inst.target);
-	qemu_plugin_outs(output);
-	qemu_plugin_outs("\n");
-
+    // if (c->valid) {
+    //     char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64,
+	// 	c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
+	// 	c->last_inst.target);
+	//     qemu_plugin_outs(output);
+	//     qemu_plugin_outs("\n");
+    // }
+	
 	// reset last_inst
 	TraceInstruction* data = (TraceInstruction*)userdata;
 	c->last_inst = *data;
+    c->valid = true;
 }
 
 static void vcpu_tb_branched_exec(unsigned int cpu_index, void* udata)
@@ -167,7 +226,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb* tb)
 	 * handle both early block exits and normal branches in the
 	 * callback if we hit it.
 	 */
-
+    
 	// update the pc for current block
 	qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(tb, QEMU_PLUGIN_INLINE_STORE_U64, tb_pc, pc);
 	// based on the pc_after_block and current pc to determine if there is a branch or an early exit
@@ -185,6 +244,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb* tb)
 	 *
 	 */
 	size_t n_insns = qemu_plugin_tb_n_insns(tb);
+
+    qemu_plugin_u64 total_insn = qemu_plugin_scoreboard_u64_in_struct(cpu_time, vCPUTime, total_insn);
+    qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(tb, QEMU_PLUGIN_INLINE_ADD_U64, total_insn, n_insns);
+
+    
 	for (size_t i = 0; i < n_insns; i++) {
 		struct qemu_plugin_insn* insn = qemu_plugin_tb_get_insn(tb, i);
 		uint64_t ipc = qemu_plugin_insn_vaddr(insn);
@@ -199,11 +263,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb* tb)
 		// ok all the data for the current instruction is ready
 		// register memory access callback
 		qemu_plugin_register_vcpu_mem_cb(
-			insn, mem_cb, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_RW, NULL);
+			insn, vcpu_mem, QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_RW, NULL);
 
 		// then we pass the information by execution callback
 		qemu_plugin_register_vcpu_insn_exec_cb(
-			insn, insn_exec_cb, QEMU_PLUGIN_CB_NO_REGS, userdata);
+			insn, vcpu_insn_exec, QEMU_PLUGIN_CB_NO_REGS, userdata);
 
 		// executed instruction (exception can happens)
 		// since we do not know whether the current inst will cause exception or not
@@ -213,8 +277,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb* tb)
 	}
 }
 
-/********************  Plugin lifecycle callbacks  ********************/
-static void exit_cb(qemu_plugin_id_t id, void* userdata) { }
+
 
 // shared by all cpus
 /********************  Plugin install  ********************/
@@ -242,10 +305,14 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t* info, int argc, 
 	plugin_init();
 
 	// initialize the variable that is local to each thread(cpu)
-	qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
-
+	qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
 	qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
-	qemu_plugin_register_atexit_cb(id, exit_cb, NULL);
+    
+    // vcpu_exit does not execute, probabaly because the program does not end normally
+    // qemu_plugin_register_vcpu_exit_cb(id, vcpu_exit); 
+
+    // for all vcpu
+	qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
 
 	return 0;
 }
@@ -254,7 +321,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t* info, int argc, 
 QEMU_PLUGIN_API
 void qemu_plugin_uninstall(qemu_plugin_id_t id, qemu_plugin_simple_cb_t cb)
 {
-	exit_cb(id, NULL);
+	plugin_exit(id, NULL);
 	if (cb) {
 		cb(id);
 	}
