@@ -170,11 +170,11 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index)
 static void vcpu_mem(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t vaddr, void* userdata)
 {
 	CPU* c = get_cpu(vcpu);
-	if (qemu_plugin_mem_is_store(info)) {
-		c->last_inst.memory_type = 1; // store
-	} else {
-		c->last_inst.memory_type = 0; // load
-	}
+	// if (qemu_plugin_mem_is_store(info)) {
+	// 	c->last_inst.memory_type = 1; // store
+	// } else {
+	// 	c->last_inst.memory_type = 0; // load
+	// }
 	c->last_inst.memory_size = qemu_plugin_mem_size_shift(info);
 	c->last_inst.exu_data.memory_address = vaddr;
 }
@@ -185,11 +185,11 @@ static void vcpu_insn_exec(unsigned int vcpu, void* userdata)
 	// using qemu_plugin_outs to print last_inst, and initialize a new last_inst
 	CPU* c = get_cpu(vcpu);
     // if (c->valid) {
-    //     char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64,
-	// 	c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
-	// 	c->last_inst.target);
-	//     qemu_plugin_outs(output);
-	//     qemu_plugin_outs("\n");
+        char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64 " ,%s",
+		c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
+		c->last_inst.target, c->last_inst.taken ? "taken": " ");
+	    qemu_plugin_outs(output);
+	    qemu_plugin_outs("\n");
     // }
 	
 	// reset last_inst
