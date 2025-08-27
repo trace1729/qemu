@@ -184,13 +184,13 @@ static void vcpu_insn_exec(unsigned int vcpu, void* userdata)
 {
 	// using qemu_plugin_outs to print last_inst, and initialize a new last_inst
 	CPU* c = get_cpu(vcpu);
-    if (c->valid) {
-        char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64,
-		c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
-		c->last_inst.target);
-	    qemu_plugin_outs(output);
-	    qemu_plugin_outs("\n");
-    }
+    // if (c->valid) {
+    //     char* output = g_strdup_printf("0x%" PRIx64 ", 0x%" PRIx32 ", 0x%" PRIx64 ", 0x%" PRIx64,
+	// 	c->last_inst.instr_pc_va, c->last_inst.instr, c->last_inst.exu_data.memory_address,
+	// 	c->last_inst.target);
+	//     qemu_plugin_outs(output);
+	//     qemu_plugin_outs("\n");
+    // }
 	
 	// reset last_inst
 	TraceInstruction* data = (TraceInstruction*)userdata;
@@ -200,17 +200,19 @@ static void vcpu_insn_exec(unsigned int vcpu, void* userdata)
 
 static void vcpu_tb_branched_exec(unsigned int cpu_index, void* udata)
 {
-	uint64_t lpc = qemu_plugin_u64_get(last_pc, cpu_index);
-	uint64_t ebpc = qemu_plugin_u64_get(end_block, cpu_index);
+	// uint64_t lpc = qemu_plugin_u64_get(last_pc, cpu_index);
+	// uint64_t ebpc = qemu_plugin_u64_get(end_block, cpu_index);
 	uint64_t pc = qemu_plugin_u64_get(tb_pc, cpu_index);
 
 	CPU* c = get_cpu(cpu_index);
-	if (lpc != ebpc) {
-		c->last_inst.exception = 1; // mark exception
-	} else {
-		c->last_inst.taken = 1; // mark taken branch
-		c->last_inst.target = pc;
-	}
+    c->last_inst.taken = 1; // mark taken branch
+	c->last_inst.target = pc;
+    
+	// if (lpc != ebpc) {
+	// 	c->last_inst.exception = 1; // mark exception
+	// } else {
+
+	// }
 }
 
 /********************  TB translation callback  ********************/
