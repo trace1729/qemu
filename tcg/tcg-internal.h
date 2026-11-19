@@ -82,6 +82,35 @@ static inline TCGv_i64 TCGV128_HIGH(TCGv_i128 t)
 }
 
 bool tcg_target_has_memory_bswap(MemOp memop);
+void tcg_process_backend_constraint_sets(const TCGBackendDispatch *dispatch);
+void tcg_backend_call_state_init(TCGBackendCallABI *call);
+
+#ifdef CONFIG_PLUGIN
+QemuPluginTbRvOrigin tcg_rv_trace_set_origin(QemuPluginTbRvOrigin origin);
+void tcg_rv_trace_restore_origin(QemuPluginTbRvOrigin prev);
+#else
+static inline QemuPluginTbRvOrigin
+tcg_rv_trace_set_origin(QemuPluginTbRvOrigin origin)
+{
+    return origin;
+}
+
+static inline void tcg_rv_trace_restore_origin(QemuPluginTbRvOrigin prev)
+{
+    (void)prev;
+}
+#endif
+
+int tcg_rv_trace_shared_begin(TCGContext *s);
+void tcg_rv_trace_shared_mov(TCGContext *s, TCGOp *op);
+void tcg_rv_trace_shared_dup(TCGContext *s, TCGOp *op);
+bool tcg_rv_trace_shared_dup2(TCGContext *s, TCGOp *op);
+void tcg_rv_trace_shared_discard(TCGContext *s, TCGOp *op);
+void tcg_rv_trace_shared_set_label(TCGContext *s, TCGOp *op);
+void tcg_rv_trace_shared_call(TCGContext *s, TCGOp *op);
+void tcg_rv_trace_shared_noreturn_call(TCGContext *s, TCGOp *op);
+bool tcg_rv_trace_shared_can_handle(TCGContext *s, TCGOp *op);
+void tcg_rv_trace_shared_default(TCGContext *s, TCGOp *op);
 
 TCGTemp *tcg_temp_new_internal(TCGType type, TCGTempKind kind);
 

@@ -33,6 +33,7 @@
 #include "tcg/tcg-mo.h"
 #include "tcg-target-reg-bits.h"
 #include "tcg-target.h"
+#include "tcg/helper-info.h"
 #include "tcg/tcg-cond.h"
 #include "tcg/insn-start-words.h"
 #include "tcg/debug-assert.h"
@@ -57,13 +58,18 @@ typedef uint64_t tcg_target_ulong;
 #error unsupported
 #endif
 
-#if TCG_TARGET_NB_REGS <= 32
-typedef uint32_t TCGRegSet;
-#elif TCG_TARGET_NB_REGS <= 64
-typedef uint64_t TCGRegSet;
-#else
+#define TCG_MAX_CODEGEN_REGS 64
+
+#if TCG_TARGET_NB_REGS > TCG_MAX_CODEGEN_REGS
 #error unsupported
 #endif
+
+/*
+ * Host codegen still uses the build-host register set, but auxiliary
+ * codegen consumers may need a wider backend-visible register map than
+ * the host does (for example RV64 trace emission on x86_64 hosts).
+ */
+typedef uint64_t TCGRegSet;
 
 typedef enum TCGOpcode {
 #define DEF(name, oargs, iargs, cargs, flags) INDEX_op_ ## name,
@@ -161,6 +167,82 @@ typedef enum TCGType {
 #endif
 } TCGType;
 
+typedef struct TCGContext TCGContext;
+typedef struct TCGBackendDispatch TCGBackendDispatch;
+typedef tcg_target_ulong TCGArg;
+
+typedef struct TCGBackendCallABI {
+    const int *iarg_regs;
+    unsigned int iarg_regs_len;
+    TCGReg (*oarg_reg)(int kind, int slot);
+    TCGReg stack_reg;
+    intptr_t stack_offset;
+    unsigned int stack_align;
+    TCGCallArgumentKind arg_kind_i32;
+    TCGCallArgumentKind arg_kind_i64;
+    TCGCallArgumentKind arg_kind_i128;
+    TCGCallReturnKind ret_kind_i128;
+    TCGHelperInfo helper_ld32_mmu;
+    TCGHelperInfo helper_ld64_mmu;
+    TCGHelperInfo helper_ld128_mmu;
+    TCGHelperInfo helper_st32_mmu;
+    TCGHelperInfo helper_st64_mmu;
+    TCGHelperInfo helper_st128_mmu;
+    GHashTable *helper_info_cache;
+} TCGBackendCallABI;
+
+typedef struct TCGBackendEmitOps {
+    bool (*const_match)(int64_t val, int ct, TCGType type,
+                        TCGCond cond, int vece);
+    void (*out_ld)(TCGContext *s, TCGType type, TCGReg ret,
+                   TCGReg arg1, intptr_t arg2);
+    bool (*out_mov)(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg);
+    void (*out_movi)(TCGContext *s, TCGType type,
+                     TCGReg ret, tcg_target_long arg);
+    void (*out_ext8s)(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg);
+    void (*out_ext16s)(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg);
+    void (*out_ext8u)(TCGContext *s, TCGReg ret, TCGReg arg);
+    void (*out_ext16u)(TCGContext *s, TCGReg ret, TCGReg arg);
+    void (*out_ext32s)(TCGContext *s, TCGReg ret, TCGReg arg);
+    void (*out_ext32u)(TCGContext *s, TCGReg ret, TCGReg arg);
+    void (*out_exts_i32_i64)(TCGContext *s, TCGReg ret, TCGReg arg);
+    void (*out_extu_i32_i64)(TCGContext *s, TCGReg ret, TCGReg arg);
+    void (*out_extrl_i64_i32)(TCGContext *s, TCGReg ret, TCGReg arg);
+    void (*out_addi_ptr)(TCGContext *s, TCGReg ret, TCGReg arg1,
+                         tcg_target_long arg2);
+    bool (*out_xchg)(TCGContext *s, TCGType type, TCGReg r1, TCGReg r2);
+    void (*out_st)(TCGContext *s, TCGType type, TCGReg arg,
+                   TCGReg arg1, intptr_t arg2);
+    bool (*out_sti)(TCGContext *s, TCGType type, TCGArg val,
+                    TCGReg base, intptr_t ofs);
+    void (*out_call)(TCGContext *s, const tcg_insn_unit *target,
+                     const TCGHelperInfo *info);
+    void (*out_goto_ptr)(TCGContext *s, TCGReg dest);
+    void (*out_set_carry)(TCGContext *s);
+    void (*out_set_borrow)(TCGContext *s);
+    bool (*out_dup_vec)(TCGContext *s, TCGType type, unsigned vece,
+                        TCGReg dst, TCGReg src);
+    bool (*out_dupm_vec)(TCGContext *s, TCGType type, unsigned vece,
+                         TCGReg dst, TCGReg base, intptr_t offset);
+    void (*out_dupi_vec)(TCGContext *s, TCGType type, unsigned vece,
+                         TCGReg dst, int64_t arg);
+    void (*out_vec_op)(TCGContext *s, TCGOpcode opc,
+                       unsigned vecl, unsigned vece,
+                       const TCGArg *args, const int *const_args);
+} TCGBackendEmitOps;
+
+typedef struct TCGBackendState {
+    unsigned int nb_regs;
+    TCGRegSet available_regs[TCG_TYPE_COUNT];
+    TCGRegSet call_clobber_regs;
+    const int *reg_alloc_order;
+    unsigned int reg_alloc_order_len;
+    int indirect_reg_alloc_order[TCG_MAX_CODEGEN_REGS];
+    TCGBackendCallABI call;
+    TCGBackendEmitOps emit;
+    const TCGBackendDispatch *dispatch;
+} TCGBackendState;
+
 /**
  * tcg_type_size
  * @t: type
@@ -176,8 +258,6 @@ static inline int tcg_type_size(TCGType t)
     }
     return 4 << i;
 }
-
-typedef tcg_target_ulong TCGArg;
 
 /* Define type and accessor macros for TCG variables.
 
@@ -305,8 +385,6 @@ typedef struct TCGTemp {
     void *state_ptr;
 } TCGTemp;
 
-typedef struct TCGContext TCGContext;
-
 typedef struct TCGTempSet {
     unsigned long l[BITS_TO_LONGS(TCG_MAX_TEMPS)];
 } TCGTempSet;
@@ -368,6 +446,7 @@ struct TCGContext {
     TCGBar guest_mo;
 
     TCGRegSet reserved_regs;
+    TCGBackendState backend;
     intptr_t current_frame_offset;
     intptr_t frame_start;
     intptr_t frame_end;
@@ -418,11 +497,9 @@ struct TCGContext {
     struct qemu_plugin_insn *plugin_insn;
 #endif
 
-    /* For host-specific values. */
-#ifdef __riscv
+    /* Current RVV state for any RISC-V backend consumer. */
     MemOp riscv_cur_vsew;
     TCGType riscv_cur_type;
-#endif
     /*
      * During the tcg_reg_alloc_op loop, we are within a sequence of
      * carry-using opcodes like addco+addci.
@@ -444,7 +521,7 @@ struct TCGContext {
 
     /* Tells which temporary holds a given register.
        It does not take into account fixed registers */
-    TCGTemp *reg_to_temp[TCG_TARGET_NB_REGS];
+    TCGTemp *reg_to_temp[TCG_MAX_CODEGEN_REGS];
 
     uint16_t gen_insn_end_off[TCG_MAX_INSNS];
     uint64_t *gen_insn_data;
@@ -723,7 +800,37 @@ static inline void *tcg_malloc(int size)
 
 void tcg_func_start(TCGContext *s);
 
+typedef struct TCGCodeGenOps {
+    int (*begin)(TCGContext *s, TranslationBlock *tb);
+    void (*tb_start)(TCGContext *s);
+    void (*mov)(TCGContext *s, TCGOp *op);
+    void (*dup)(TCGContext *s, TCGOp *op);
+    bool (*dup2)(TCGContext *s, TCGOp *op);
+    void (*insn_start)(TCGContext *s, TCGOp *op, int *num_insns);
+    void (*discard)(TCGContext *s, TCGOp *op);
+    void (*set_label)(TCGContext *s, TCGOp *op);
+    void (*call)(TCGContext *s, TCGOp *op);
+    void (*exit_tb)(TCGContext *s, TCGOp *op);
+    void (*goto_tb)(TCGContext *s, TCGOp *op);
+    void (*br)(TCGContext *s, TCGOp *op);
+    void (*mb)(TCGContext *s, TCGOp *op);
+    void (*default_op)(TCGContext *s, TCGOp *op);
+    int (*check_overflow)(TCGContext *s);
+    int (*finish)(TCGContext *s, int num_insns);
+} TCGCodeGenOps;
+
 int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start);
+int tcg_gen_code_common(TCGContext *s, TranslationBlock *tb,
+                        const TCGCodeGenOps *ops);
+void tcg_plugin_tb_build_rv_trace(TCGContext *s, TranslationBlock *tb);
+int tcg_tb_emit_rv_tagged(uint32_t *buf, uint8_t *tags, int buf_size,
+                          int *insn_offsets,
+                          qemu_plugin_rv_insn_meta *insn_meta,
+                          int *n_guest_insns);
+int tcg_tb_emit_rv(uint32_t *buf, int buf_size,
+                   int *insn_offsets,
+                   qemu_plugin_rv_insn_meta *insn_meta,
+                   int *n_guest_insns);
 
 void tb_target_set_jmp_target(const TranslationBlock *, int,
                               uintptr_t, uintptr_t);
@@ -746,6 +853,172 @@ typedef struct TCGArgConstraint {
 } TCGArgConstraint;
 
 #define TCG_MAX_OP_ARGS 16
+
+typedef int TCGConstraintSetIndex;
+
+enum {
+    C_Dynamic = -2,
+    C_NotImplemented = -1,
+};
+
+typedef struct TCGConstraintSet {
+    uint8_t nb_oargs, nb_iargs;
+    const char *args_ct_str[TCG_MAX_OP_ARGS];
+} TCGConstraintSet;
+
+/*
+ * TCGOutOp is the base class for structures that describe how to lower a
+ * given TCGOpcode through the shared regalloc/emission path.
+ */
+typedef struct TCGOutOp {
+    TCGConstraintSetIndex static_constraint;
+    TCGConstraintSetIndex (*dynamic_constraint)(TCGType type, unsigned flags);
+} TCGOutOp;
+
+typedef struct TCGOutOpAddSubCarry {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type,
+                    TCGReg a0, TCGReg a1, TCGReg a2);
+    void (*out_rri)(TCGContext *s, TCGType type,
+                    TCGReg a0, TCGReg a1, tcg_target_long a2);
+    void (*out_rir)(TCGContext *s, TCGType type,
+                    TCGReg a0, tcg_target_long a1, TCGReg a2);
+    void (*out_rii)(TCGContext *s, TCGType type,
+                    TCGReg a0, tcg_target_long a1, tcg_target_long a2);
+} TCGOutOpAddSubCarry;
+
+typedef struct TCGOutOpBinary {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type,
+                    TCGReg a0, TCGReg a1, TCGReg a2);
+    void (*out_rri)(TCGContext *s, TCGType type,
+                    TCGReg a0, TCGReg a1, tcg_target_long a2);
+} TCGOutOpBinary;
+
+typedef struct TCGOutOpBrcond {
+    TCGOutOp base;
+    void (*out_rr)(TCGContext *s, TCGType type, TCGCond cond,
+                   TCGReg a1, TCGReg a2, TCGLabel *label);
+    void (*out_ri)(TCGContext *s, TCGType type, TCGCond cond,
+                   TCGReg a1, tcg_target_long a2, TCGLabel *label);
+} TCGOutOpBrcond;
+
+typedef struct TCGOutOpBrcond2 {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGCond cond, TCGReg al, TCGReg ah,
+                TCGArg bl, bool const_bl,
+                TCGArg bh, bool const_bh, TCGLabel *l);
+} TCGOutOpBrcond2;
+
+typedef struct TCGOutOpBswap {
+    TCGOutOp base;
+    void (*out_rr)(TCGContext *s, TCGType type,
+                   TCGReg a0, TCGReg a1, unsigned flags);
+} TCGOutOpBswap;
+
+typedef struct TCGOutOpDeposit {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                    TCGReg a2, unsigned ofs, unsigned len);
+    void (*out_rri)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                    tcg_target_long a2, unsigned ofs, unsigned len);
+    void (*out_rzr)(TCGContext *s, TCGType type, TCGReg a0,
+                    TCGReg a2, unsigned ofs, unsigned len);
+} TCGOutOpDeposit;
+
+typedef struct TCGOutOpDivRem {
+    TCGOutOp base;
+    void (*out_rr01r)(TCGContext *s, TCGType type,
+                      TCGReg a0, TCGReg a1, TCGReg a4);
+} TCGOutOpDivRem;
+
+typedef struct TCGOutOpExtract {
+    TCGOutOp base;
+    void (*out_rr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                   unsigned ofs, unsigned len);
+} TCGOutOpExtract;
+
+typedef struct TCGOutOpExtract2 {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1,
+                    TCGReg a2, unsigned shr);
+} TCGOutOpExtract2;
+
+typedef struct TCGOutOpLoad {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg dest,
+                TCGReg base, intptr_t offset);
+} TCGOutOpLoad;
+
+typedef struct TCGOutOpMovcond {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGCond cond,
+                TCGReg ret, TCGReg c1, TCGArg c2, bool const_c2,
+                TCGArg vt, bool const_vt, TCGArg vf, bool consf_vf);
+} TCGOutOpMovcond;
+
+typedef struct TCGOutOpMul2 {
+    TCGOutOp base;
+    void (*out_rrrr)(TCGContext *s, TCGType type,
+                     TCGReg a0, TCGReg a1, TCGReg a2, TCGReg a3);
+} TCGOutOpMul2;
+
+typedef struct TCGOutOpQemuLdSt {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg dest,
+                TCGReg addr, MemOpIdx oi);
+} TCGOutOpQemuLdSt;
+
+typedef struct TCGOutOpQemuLdSt2 {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGType type, TCGReg dlo, TCGReg dhi,
+                TCGReg addr, MemOpIdx oi);
+} TCGOutOpQemuLdSt2;
+
+typedef struct TCGOutOpUnary {
+    TCGOutOp base;
+    void (*out_rr)(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1);
+} TCGOutOpUnary;
+
+typedef struct TCGOutOpSetcond {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type, TCGCond cond,
+                    TCGReg ret, TCGReg a1, TCGReg a2);
+    void (*out_rri)(TCGContext *s, TCGType type, TCGCond cond,
+                    TCGReg ret, TCGReg a1, tcg_target_long a2);
+} TCGOutOpSetcond;
+
+typedef struct TCGOutOpSetcond2 {
+    TCGOutOp base;
+    void (*out)(TCGContext *s, TCGCond cond, TCGReg ret, TCGReg al, TCGReg ah,
+                TCGArg bl, bool const_bl, TCGArg bh, bool const_bh);
+} TCGOutOpSetcond2;
+
+typedef struct TCGOutOpStore {
+    TCGOutOp base;
+    void (*out_r)(TCGContext *s, TCGType type, TCGReg data,
+                  TCGReg base, intptr_t offset);
+    void (*out_i)(TCGContext *s, TCGType type, tcg_target_long data,
+                  TCGReg base, intptr_t offset);
+} TCGOutOpStore;
+
+typedef struct TCGOutOpSubtract {
+    TCGOutOp base;
+    void (*out_rrr)(TCGContext *s, TCGType type,
+                    TCGReg a0, TCGReg a1, TCGReg a2);
+    void (*out_rir)(TCGContext *s, TCGType type,
+                    TCGReg a0, tcg_target_long a1, TCGReg a2);
+} TCGOutOpSubtract;
+
+struct TCGBackendDispatch {
+    const TCGConstraintSet *constraint_sets;
+    size_t constraint_set_count;
+    TCGArgConstraint (*all_cts)[TCG_MAX_OP_ARGS];
+    const TCGOutOp * const *all_outop;
+    TCGConstraintSetIndex (*target_op_def)(TCGOpcode op, TCGType type,
+                                           unsigned flags);
+    bool (*parse_constraint)(TCGArgConstraint *arg_ct, char ch);
+};
 
 /* Bits for TCGOpDef->flags, 8 bits available, all used.  */
 enum {

@@ -76,7 +76,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 5
+#define QEMU_PLUGIN_VERSION 6
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -329,6 +329,17 @@ typedef void (*qemu_plugin_vcpu_tb_trans_cb_t)(qemu_plugin_id_t id,
                                                struct qemu_plugin_tb *tb);
 
 /**
+ * typedef qemu_plugin_tb_codegen_cb_t - post-codegen TB callback
+ * @tb: opaque translation block handle
+ * @userdata: plugin-supplied callback data
+ *
+ * Called after the core codegen pipeline has published the final RV trace
+ * bundle for a TB.
+ */
+typedef void (*qemu_plugin_tb_codegen_cb_t)(struct qemu_plugin_tb *tb,
+                                            void *userdata);
+
+/**
  * qemu_plugin_register_vcpu_tb_trans_cb() - register a translate cb
  * @id: plugin ID
  * @cb: callback function
@@ -343,6 +354,21 @@ typedef void (*qemu_plugin_vcpu_tb_trans_cb_t)(qemu_plugin_id_t id,
 QEMU_PLUGIN_API
 void qemu_plugin_register_vcpu_tb_trans_cb(qemu_plugin_id_t id,
                                            qemu_plugin_vcpu_tb_trans_cb_t cb);
+
+#ifndef QEMU_PLUGIN_TB_CODEGEN_API_DECLS
+#define QEMU_PLUGIN_TB_CODEGEN_API_DECLS
+/**
+ * qemu_plugin_tb_register_codegen_cb() - register a post-codegen TB callback
+ * @tb: opaque qemu_plugin_tb handle for the translation
+ * @cb: callback function
+ * @userdata: callback data passed to @cb
+ * @destroy: optional destroy callback for @userdata
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_tb_register_codegen_cb(struct qemu_plugin_tb *tb,
+                                        qemu_plugin_tb_codegen_cb_t cb,
+                                        void *userdata,
+                                        GDestroyNotify destroy);
 
 /**
  * qemu_plugin_register_vcpu_tb_exec_cb() - register execution callback
@@ -542,6 +568,177 @@ uint64_t qemu_plugin_insn_vaddr(const struct qemu_plugin_insn *insn);
  */
 QEMU_PLUGIN_API
 void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn);
+
+/**
+ * QEMU_PLUGIN_RV_MAX_MEM - maximum number of guest-visible memory
+ * operations tracked per guest instruction.
+ */
+#define QEMU_PLUGIN_RV_MAX_MEM 4
+
+/**
+ * enum qemu_plugin_rv_trace_tag - provenance tag for one emitted RV word
+ * @QEMU_PLUGIN_RV_TAG_NONE: no exported tag
+ * @QEMU_PLUGIN_RV_TAG_MOVCOND: emitted from movcond lowering
+ * @QEMU_PLUGIN_RV_TAG_HELPER_PLACEHOLDER: emitted from helper placeholder
+ * @QEMU_PLUGIN_RV_TAG_INDIRECT_BRANCH_PLACEHOLDER: emitted from indirect
+ *        branch placeholder lowering
+ * @QEMU_PLUGIN_RV_TAG_GENERIC_DEPENDENCY_PLACEHOLDER: emitted from the generic
+ *        dependency-placeholder fallback path
+ */
+typedef enum qemu_plugin_rv_trace_tag {
+    QEMU_PLUGIN_RV_TAG_NONE = 0,
+    QEMU_PLUGIN_RV_TAG_MOVCOND,
+    QEMU_PLUGIN_RV_TAG_HELPER_PLACEHOLDER,
+    QEMU_PLUGIN_RV_TAG_INDIRECT_BRANCH_PLACEHOLDER,
+    QEMU_PLUGIN_RV_TAG_GENERIC_DEPENDENCY_PLACEHOLDER,
+} qemu_plugin_rv_trace_tag;
+
+/**
+ * struct qemu_plugin_rv_insn_meta - per-guest-instruction metadata from
+ * the TCGOp->RISC-V emission pass.
+ * @n_mem: number of guest-visible memory ops in this expansion.
+ * @mem_idxs: indices within this guest instruction's RISC-V expansion
+ *            of the records corresponding to guest memory operations
+ *            (qemu_ld/qemu_st). Only the first @n_mem entries are valid.
+ * @branch_idx: index within this guest instruction's RISC-V expansion
+ *              of the record corresponding to a branch/jump, or -1
+ *              if none.
+ * @exception_idx: index within this guest instruction's RISC-V expansion
+ *                 of the record corresponding to a guest-visible exception,
+ *                 or -1 if none.
+ * @helper_idx: index within this guest instruction's RISC-V expansion
+ *              of the first helper-placeholder record, or -1 if none.
+ * @emitting_tcg_ops: number of optimized TCGOps attributed to this guest
+ *                    instruction that leave at least one final guest-origin
+ *                    RV word visible after the shared lowering/filtering flow.
+ */
+typedef struct {
+    int8_t n_mem;
+    int8_t mem_idxs[QEMU_PLUGIN_RV_MAX_MEM];
+    int8_t branch_idx;
+    int8_t exception_idx;
+    int8_t helper_idx;
+    uint16_t emitting_tcg_ops;
+} qemu_plugin_rv_insn_meta;
+
+/**
+ * qemu_plugin_tb_emit_rv_tagged() - emit RISC-V instruction encodings for a TB
+ * @buf: output buffer for uint32_t RISC-V instruction words
+ * @tags: optional parallel output buffer for @buf provenance tags. When
+ *        non-NULL, the caller must provide space for at least @buf_size
+ *        entries and each emitted RV word gets one qemu_plugin_rv_trace_tag.
+ * @buf_size: maximum number of entries in @buf
+ * @insn_offsets: output array. insn_offsets[i] = starting index in @buf for
+ *               guest instruction i. Caller must allocate space for at least
+ *               qemu_plugin_tb_n_insns(tb) + 1 entries.
+ * @insn_meta: output array of per-guest-instruction metadata. Caller must
+ *             allocate space for at least qemu_plugin_tb_n_insns(tb) entries.
+ *             May be NULL if metadata is not needed.
+ * @n_guest_insns: output, number of guest instructions processed
+ *
+ * Must be called from within a vcpu_tb_trans_cb callback.
+ *
+ * Walks the internal TCGOp list for the current translation block and
+ * emits RISC-V instruction encodings for each TCGOp. Guest-internal
+ * CPU-state loads/stores (INDEX_op_ld*, INDEX_op_st*) are skipped;
+ * only guest-visible operations produce trace records. Each guest
+ * instruction may expand to one or more RISC-V instructions. The
+ * @insn_offsets array records where each guest instruction's RISC-V
+ * sequence starts. The @insn_meta array records which emitted record
+ * within each expansion corresponds to the guest memory, branch, or
+ * helper-placeholder op. When @tags is non-NULL, the parallel @tags entry
+ * records the lowering provenance for each emitted RV word.
+ *
+ * Returns: total number of RISC-V instructions emitted, or -1 on error.
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_tb_emit_rv_tagged(uint32_t *buf, uint8_t *tags, int buf_size,
+                                  int *insn_offsets,
+                                  qemu_plugin_rv_insn_meta *insn_meta,
+                                  int *n_guest_insns);
+
+/**
+ * qemu_plugin_tb_emit_rv() - compatibility wrapper without provenance tags
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_tb_emit_rv(uint32_t *buf, int buf_size,
+                           int *insn_offsets,
+                           qemu_plugin_rv_insn_meta *insn_meta,
+                           int *n_guest_insns);
+
+/**
+ * qemu_plugin_tb_get_rv_trace() - fetch the core-owned RV bundle for a TB
+ * @tb: opaque qemu_plugin_tb handle for the translation
+ * @insns: returned RV instruction words
+ * @tags: returned provenance tags parallel to @insns
+ * @insn_offsets: returned guest-insn to RV-slice offsets
+ * @insn_meta: returned per-guest-instruction metadata
+ * @total_insns: returned number of RV records in @insns
+ * @n_guest_insns: returned number of guest instructions in the TB
+ *
+ * Returns: true when a bundle is available, otherwise false.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_tb_get_rv_trace(const struct qemu_plugin_tb *tb,
+                                 const uint32_t **insns,
+                                 const uint8_t **tags,
+                                 const int **insn_offsets,
+                                 const qemu_plugin_rv_insn_meta **insn_meta,
+                                 int *total_insns,
+                                 int *n_guest_insns);
+
+/**
+ * qemu_plugin_tb_set_rv_guest_semantic_fallback() - cache a guest fallback
+ * @tb: opaque qemu_plugin_tb handle for the translation
+ * @insn_idx: guest instruction index within the TB
+ * @insn: single-word RV guest-semantic fallback to use for this guest insn
+ *
+ * Translation callbacks can use this to cache a one-word guest-semantic
+ * fallback for guest instructions whose raw bytes are available during
+ * translation but not reliably available during later codegen callbacks.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_tb_set_rv_guest_semantic_fallback(struct qemu_plugin_tb *tb,
+                                                   size_t insn_idx,
+                                                   uint32_t insn);
+
+/**
+ * qemu_plugin_tb_get_rv_guest_semantic_fallback() - fetch a cached fallback
+ * @tb: opaque qemu_plugin_tb handle for the translation
+ * @insn_idx: guest instruction index within the TB
+ * @insn: returned RV guest-semantic fallback word
+ *
+ * Returns: true when a cached guest-semantic fallback is available.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_tb_get_rv_guest_semantic_fallback(const struct qemu_plugin_tb *tb,
+                                                   size_t insn_idx,
+                                                   uint32_t *insn);
+
+/**
+ * qemu_plugin_tb_set_rv_guest_semantic_tag() - cache a semantic trace tag
+ * @tb: opaque qemu_plugin_tb handle for the translation
+ * @insn_idx: guest instruction index within the TB
+ * @tag: semantic tag to reuse during later RV trace codegen
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_tb_set_rv_guest_semantic_tag(struct qemu_plugin_tb *tb,
+                                              size_t insn_idx,
+                                              qemu_plugin_rv_trace_tag tag);
+
+/**
+ * qemu_plugin_tb_get_rv_guest_semantic_tag() - fetch a cached semantic tag
+ * @tb: opaque qemu_plugin_tb handle for the translation
+ * @insn_idx: guest instruction index within the TB
+ * @tag: returned semantic tag
+ *
+ * Returns: true when a cached semantic tag is available.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_tb_get_rv_guest_semantic_tag(const struct qemu_plugin_tb *tb,
+                                              size_t insn_idx,
+                                              qemu_plugin_rv_trace_tag *tag);
+#endif /* QEMU_PLUGIN_TB_CODEGEN_API_DECLS */
 
 /**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle

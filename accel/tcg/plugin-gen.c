@@ -429,6 +429,7 @@ bool plugin_gen_tb_start(CPUState *cpu, const DisasContextBase *db)
         if (ptb->cbs) {
             g_array_set_size(ptb->cbs, 0);
         }
+        qemu_plugin_tb_reset_codegen(ptb);
         ptb->n = 0;
         ptb->mem_helper = false;
     } else {
@@ -436,6 +437,7 @@ bool plugin_gen_tb_start(CPUState *cpu, const DisasContextBase *db)
         tcg_ctx->plugin_tb = ptb;
         ptb->insns = g_ptr_array_new();
     }
+    ptb->cpu = cpu;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_TB);
     return true;
@@ -457,10 +459,12 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
         insn = g_new0(struct qemu_plugin_insn, 1);
         g_ptr_array_add(ptb->insns, insn);
     }
+    insn->tb = ptb;
 
     tcg_ctx->plugin_insn = insn;
     insn->calls_helpers = false;
     insn->mem_helper = false;
+    insn->data_len = 0;
     if (insn->insn_cbs) {
         g_array_set_size(insn->insn_cbs, 0);
     }
@@ -478,8 +482,16 @@ void plugin_gen_insn_end(void)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;
     struct qemu_plugin_insn *pinsn = tcg_ctx->plugin_insn;
+    size_t data_len;
 
     pinsn->len = db->fake_insn ? db->record_len : db->pc_next - pinsn->vaddr;
+    data_len = MIN(sizeof(pinsn->data), (size_t)pinsn->len);
+    if (data_len > 0 &&
+        translator_st(db, pinsn->data, pinsn->vaddr, data_len)) {
+        pinsn->data_len = data_len;
+    } else {
+        pinsn->data_len = 0;
+    }
 
     tcg_gen_plugin_cb(PLUGIN_GEN_AFTER_INSN);
 }
@@ -490,7 +502,8 @@ void plugin_gen_insn_end(void)
  * do any clean-up here and make sure things are reset in
  * plugin_gen_tb_start.
  */
-void plugin_gen_tb_end(CPUState *cpu, size_t num_insns)
+void plugin_gen_tb_end(CPUState *cpu, const DisasContextBase *db,
+                       size_t num_insns)
 {
     struct qemu_plugin_tb *ptb = tcg_ctx->plugin_tb;
 
@@ -504,7 +517,14 @@ void plugin_gen_tb_end(CPUState *cpu, size_t num_insns)
     /* inject the instrumentation at the appropriate places */
     plugin_gen_inject(ptb);
 
-    /* reset plugin translation state (plugin_tb is reused between blocks) */
-    tcg_ctx->plugin_db = NULL;
+    /*
+     * Post-codegen callbacks run after the target translator has returned, so
+     * preserve a by-value snapshot of the translation context for public query
+     * helpers like qemu_plugin_tb_vaddr() and qemu_plugin_insn_data().
+     */
+    ptb->cpu = cpu;
+    ptb->codegen_db = *db;
+    ptb->have_codegen_db = true;
+    tcg_ctx->plugin_db = &ptb->codegen_db;
     tcg_ctx->plugin_insn = NULL;
 }

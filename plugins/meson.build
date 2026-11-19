@@ -61,8 +61,9 @@ endif
 user_ss.add(files('user.c', 'api-user.c'))
 system_ss.add(files('system.c', 'api-system.c'))
 
-user_ss.add(files('api.c', 'core.c'))
-system_ss.add(files('api.c', 'core.c'))
+user_ss.add(files('api.c', 'api_plugin.c', 'core.c', 'tracertl_rv_helpers.c',
+                  'tracertl_rv_vector_lowering.c'))
+system_ss.add(files('api.c', 'api_plugin.c', 'core.c', 'tracertl_rv_helpers.c',
+                    'tracertl_rv_vector_lowering.c'))
 
 common_ss.add(files('loader.c'))
-

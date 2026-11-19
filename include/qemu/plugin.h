@@ -15,6 +15,7 @@
 #include "qemu/plugin-event.h"
 #include "qemu/bitmap.h"
 #include "exec/memopidx.h"
+#include "exec/translator.h"
 #include "hw/core/cpu.h"
 
 /*
@@ -42,6 +43,12 @@ get_plugin_meminfo_rw(qemu_plugin_meminfo_t i)
 {
     return i >> 16;
 }
+
+typedef enum QemuPluginTbRvOrigin {
+    QEMU_PLUGIN_TB_RV_ORIGIN_GUEST = 0,
+    QEMU_PLUGIN_TB_RV_ORIGIN_ALLOCATOR_PRIVATE,
+    QEMU_PLUGIN_TB_RV_ORIGIN_HELPER_PRIVATE,
+} QemuPluginTbRvOrigin;
 
 #ifdef CONFIG_PLUGIN
 extern QemuOptsList qemu_plugin_opts;
@@ -72,6 +79,25 @@ enum plugin_dyn_cb_type {
     PLUGIN_CB_MEM_REGULAR,
     PLUGIN_CB_INLINE_ADD_U64,
     PLUGIN_CB_INLINE_STORE_U64,
+};
+
+typedef void (*qemu_plugin_tb_codegen_cb_t)(struct qemu_plugin_tb *tb,
+                                            void *userdata);
+
+struct qemu_plugin_tb_codegen_hook {
+    qemu_plugin_tb_codegen_cb_t cb;
+    GDestroyNotify destroy;
+    void *userdata;
+};
+
+struct qemu_plugin_tb_rv_trace {
+    uint32_t *insns;
+    uint8_t *tags;
+    uint8_t *origins;
+    int *insn_offsets;
+    qemu_plugin_rv_insn_meta *insn_meta;
+    int total_insns;
+    int n_guest_insns;
 };
 
 struct qemu_plugin_regular_cb {
@@ -110,12 +136,17 @@ struct qemu_plugin_dyn_cb {
     };
 };
 
+struct qemu_plugin_tb;
+
 /* Internal context for instrumenting an instruction */
 struct qemu_plugin_insn {
+    struct qemu_plugin_tb *tb;
     uint64_t vaddr;
     GArray *insn_cbs;
     GArray *mem_cbs;
     uint8_t len;
+    uint8_t data_len;
+    uint8_t data[16];
     bool calls_helpers;
 
     /* if set, the instruction calls helpers that might access guest memory */
@@ -132,11 +163,18 @@ struct qemu_plugin_scoreboard {
 struct qemu_plugin_tb {
     GPtrArray *insns;
     size_t n;
+    CPUState *cpu;
+    DisasContextBase codegen_db;
+    bool have_codegen_db;
 
     /* if set, the TB calls helpers that might access guest memory */
     bool mem_helper;
 
     GArray *cbs;
+    GArray *codegen_cbs;
+    GArray *rv_guest_semantic_fallbacks;
+    GArray *rv_guest_semantic_tags;
+    struct qemu_plugin_tb_rv_trace rv_trace;
 };
 
 /**
@@ -176,6 +214,29 @@ void qemu_plugin_flush_cb(void);
 void qemu_plugin_atexit_cb(void);
 
 void qemu_plugin_add_dyn_cb_arr(GArray *arr);
+#ifndef QEMU_PLUGIN_TB_CODEGEN_API_DECLS
+void qemu_plugin_tb_register_codegen_cb(struct qemu_plugin_tb *tb,
+                                        qemu_plugin_tb_codegen_cb_t cb,
+                                        void *userdata,
+                                        GDestroyNotify destroy);
+bool qemu_plugin_tb_get_rv_trace(const struct qemu_plugin_tb *tb,
+                                 const uint32_t **insns,
+                                 const uint8_t **tags,
+                                 const int **insn_offsets,
+                                 const qemu_plugin_rv_insn_meta **insn_meta,
+                                 int *total_insns,
+                                 int *n_guest_insns);
+#endif
+size_t qemu_plugin_insn_data_cached(const struct qemu_plugin_insn *insn,
+                                    void *dest, size_t len);
+void qemu_plugin_tb_codegen_cb(struct qemu_plugin_tb *tb);
+void qemu_plugin_tb_reset_codegen(struct qemu_plugin_tb *tb);
+void qemu_plugin_tb_set_rv_trace(struct qemu_plugin_tb *tb,
+                                 uint32_t *insns, uint8_t *tags,
+                                 uint8_t *origins,
+                                 int *insn_offsets,
+                                 qemu_plugin_rv_insn_meta *insn_meta,
+                                 int total_insns, int n_guest_insns);
 
 static inline void qemu_plugin_disable_mem_helpers(CPUState *cpu)
 {

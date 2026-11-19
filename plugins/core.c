@@ -465,6 +465,235 @@ void plugin_register_vcpu_mem_cb(GArray **arr,
     dyn_cb->regular = regular_cb;
 }
 
+static void qemu_plugin_tb_clear_rv_trace(struct qemu_plugin_tb *tb)
+{
+    g_free(tb->rv_trace.insns);
+    g_free(tb->rv_trace.tags);
+    g_free(tb->rv_trace.origins);
+    g_free(tb->rv_trace.insn_offsets);
+    g_free(tb->rv_trace.insn_meta);
+    memset(&tb->rv_trace, 0, sizeof(tb->rv_trace));
+}
+
+static void qemu_plugin_tb_clear_rv_guest_semantic_fallbacks(struct qemu_plugin_tb *tb)
+{
+    if (!tb->rv_guest_semantic_fallbacks) {
+        return;
+    }
+
+    g_array_set_size(tb->rv_guest_semantic_fallbacks, 0);
+}
+
+static void qemu_plugin_tb_clear_rv_guest_semantic_tags(struct qemu_plugin_tb *tb)
+{
+    if (!tb->rv_guest_semantic_tags) {
+        return;
+    }
+
+    g_array_set_size(tb->rv_guest_semantic_tags, 0);
+}
+
+static void qemu_plugin_tb_clear_codegen_cbs(struct qemu_plugin_tb *tb)
+{
+    if (!tb->codegen_cbs) {
+        return;
+    }
+
+    for (guint i = 0; i < tb->codegen_cbs->len; i++) {
+        struct qemu_plugin_tb_codegen_hook *hook =
+            &g_array_index(tb->codegen_cbs,
+                           struct qemu_plugin_tb_codegen_hook, i);
+
+        if (hook->destroy) {
+            hook->destroy(hook->userdata);
+        }
+    }
+
+    g_array_set_size(tb->codegen_cbs, 0);
+}
+
+void qemu_plugin_tb_register_codegen_cb(struct qemu_plugin_tb *tb,
+                                        qemu_plugin_tb_codegen_cb_t cb,
+                                        void *userdata,
+                                        GDestroyNotify destroy)
+{
+    struct qemu_plugin_tb_codegen_hook hook = {
+        .cb = cb,
+        .destroy = destroy,
+        .userdata = userdata,
+    };
+
+    if (!tb->codegen_cbs) {
+        tb->codegen_cbs = g_array_sized_new(false, true,
+                                            sizeof(hook), 1);
+    }
+
+    g_array_append_val(tb->codegen_cbs, hook);
+}
+
+void qemu_plugin_tb_codegen_cb(struct qemu_plugin_tb *tb)
+{
+    if (!tb->codegen_cbs) {
+        return;
+    }
+
+    for (guint i = 0; i < tb->codegen_cbs->len; i++) {
+        struct qemu_plugin_tb_codegen_hook *hook =
+            &g_array_index(tb->codegen_cbs,
+                           struct qemu_plugin_tb_codegen_hook, i);
+
+        hook->cb(tb, hook->userdata);
+        if (hook->destroy) {
+            hook->destroy(hook->userdata);
+            hook->destroy = NULL;
+            hook->userdata = NULL;
+        }
+    }
+
+    g_array_set_size(tb->codegen_cbs, 0);
+}
+
+void qemu_plugin_tb_reset_codegen(struct qemu_plugin_tb *tb)
+{
+    qemu_plugin_tb_clear_codegen_cbs(tb);
+    qemu_plugin_tb_clear_rv_trace(tb);
+    qemu_plugin_tb_clear_rv_guest_semantic_fallbacks(tb);
+    qemu_plugin_tb_clear_rv_guest_semantic_tags(tb);
+    tb->have_codegen_db = false;
+    tb->cpu = NULL;
+}
+
+void qemu_plugin_tb_set_rv_trace(struct qemu_plugin_tb *tb,
+                                 uint32_t *insns, uint8_t *tags,
+                                 uint8_t *origins,
+                                 int *insn_offsets,
+                                 qemu_plugin_rv_insn_meta *insn_meta,
+                                 int total_insns, int n_guest_insns)
+{
+    qemu_plugin_tb_clear_rv_trace(tb);
+
+    tb->rv_trace.insns = insns;
+    tb->rv_trace.tags = tags;
+    tb->rv_trace.origins = origins;
+    tb->rv_trace.insn_offsets = insn_offsets;
+    tb->rv_trace.insn_meta = insn_meta;
+    tb->rv_trace.total_insns = total_insns;
+    tb->rv_trace.n_guest_insns = n_guest_insns;
+}
+
+void qemu_plugin_tb_set_rv_guest_semantic_fallback(struct qemu_plugin_tb *tb,
+                                                   size_t insn_idx,
+                                                   uint32_t insn)
+{
+    uint32_t zero = 0;
+
+    if (!tb->rv_guest_semantic_fallbacks) {
+        tb->rv_guest_semantic_fallbacks = g_array_sized_new(false, true,
+                                                            sizeof(uint32_t),
+                                                            tb->n ? tb->n : 1);
+    }
+    while (tb->rv_guest_semantic_fallbacks->len <= insn_idx) {
+        g_array_append_val(tb->rv_guest_semantic_fallbacks, zero);
+    }
+
+    g_array_index(tb->rv_guest_semantic_fallbacks, uint32_t, insn_idx) = insn;
+}
+
+bool qemu_plugin_tb_get_rv_guest_semantic_fallback(const struct qemu_plugin_tb *tb,
+                                                   size_t insn_idx,
+                                                   uint32_t *insn)
+{
+    uint32_t value;
+
+    if (!tb->rv_guest_semantic_fallbacks ||
+        insn_idx >= tb->rv_guest_semantic_fallbacks->len) {
+        return false;
+    }
+
+    value = g_array_index(tb->rv_guest_semantic_fallbacks, uint32_t, insn_idx);
+    if (value == 0) {
+        return false;
+    }
+
+    if (insn) {
+        *insn = value;
+    }
+    return true;
+}
+
+void qemu_plugin_tb_set_rv_guest_semantic_tag(struct qemu_plugin_tb *tb,
+                                              size_t insn_idx,
+                                              qemu_plugin_rv_trace_tag tag)
+{
+    uint8_t zero = 0;
+
+    if (!tb->rv_guest_semantic_tags) {
+        tb->rv_guest_semantic_tags = g_array_sized_new(false, true,
+                                                       sizeof(uint8_t),
+                                                       tb->n ? tb->n : 1);
+    }
+    while (tb->rv_guest_semantic_tags->len <= insn_idx) {
+        g_array_append_val(tb->rv_guest_semantic_tags, zero);
+    }
+
+    g_array_index(tb->rv_guest_semantic_tags, uint8_t, insn_idx) = (uint8_t)tag;
+}
+
+bool qemu_plugin_tb_get_rv_guest_semantic_tag(const struct qemu_plugin_tb *tb,
+                                              size_t insn_idx,
+                                              qemu_plugin_rv_trace_tag *tag)
+{
+    uint8_t value;
+
+    if (!tb->rv_guest_semantic_tags ||
+        insn_idx >= tb->rv_guest_semantic_tags->len) {
+        return false;
+    }
+
+    value = g_array_index(tb->rv_guest_semantic_tags, uint8_t, insn_idx);
+    if (value == 0) {
+        return false;
+    }
+
+    if (tag) {
+        *tag = (qemu_plugin_rv_trace_tag)value;
+    }
+    return true;
+}
+
+bool qemu_plugin_tb_get_rv_trace(const struct qemu_plugin_tb *tb,
+                                 const uint32_t **insns,
+                                 const uint8_t **tags,
+                                 const int **insn_offsets,
+                                 const qemu_plugin_rv_insn_meta **insn_meta,
+                                 int *total_insns,
+                                 int *n_guest_insns)
+{
+    if (!tb->rv_trace.insns || tb->rv_trace.total_insns <= 0) {
+        return false;
+    }
+
+    if (insns) {
+        *insns = tb->rv_trace.insns;
+    }
+    if (tags) {
+        *tags = tb->rv_trace.tags;
+    }
+    if (insn_offsets) {
+        *insn_offsets = tb->rv_trace.insn_offsets;
+    }
+    if (insn_meta) {
+        *insn_meta = tb->rv_trace.insn_meta;
+    }
+    if (total_insns) {
+        *total_insns = tb->rv_trace.total_insns;
+    }
+    if (n_guest_insns) {
+        *n_guest_insns = tb->rv_trace.n_guest_insns;
+    }
+    return true;
+}
+
 /*
  * Disable CFI checks.
  * The callback function has been loaded from an external library so we do not

@@ -15,6 +15,10 @@ tcg_ss.add(files(
   'tcg-op-vec.c',
 ))
 
+if get_option('plugins')
+  tcg_ss.add(files('tcg-rv-trace.c'))
+endif
+
 if get_option('tcg_interpreter')
   libffi = dependency('libffi', version: '>=3.0', required: true,
                       method: 'pkg-config')

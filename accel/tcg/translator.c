@@ -225,7 +225,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     tb->icount = db->num_insns;
 
     if (plugin_enabled) {
-        plugin_gen_tb_end(cpu, db->num_insns);
+        plugin_gen_tb_end(cpu, db, db->num_insns);
     }
 
     if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)

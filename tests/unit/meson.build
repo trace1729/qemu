@@ -2,6 +2,19 @@
 testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
 
 tests = {
+  'test-tracertl-guest-branch': [meson.project_source_root() / 'contrib/plugins/tracertl_guest_branch.c'],
+  'test-tracertl-carry-rv': [meson.project_source_root() / 'plugins/tracertl_rv_helpers.c'],
+  'test-plugin-icount-range': [
+    meson.project_source_root() / 'contrib/plugins/plugin_icount_range.c',
+  ],
+  'test-tracertl-runtime': [
+    meson.project_source_root() / 'contrib/plugins/tracertl_runtime_helpers.c',
+    meson.project_source_root() / 'plugins/tracertl_rv_helpers.c',
+  ],
+  'test-tracertl-rv-lowering': [
+    meson.project_source_root() / 'plugins/tracertl_rv_helpers.c',
+  ],
+  'test-tracertl-pc-tags': [],
   'check-block-qdict': [],
   'check-qdict': [],
   'check-qnum': [],
@@ -49,6 +62,12 @@ tests = {
   'test-interval-tree': [],
   'test-fifo': [],
 }
+
+if zstd.found()
+  tests += {
+    'test-tracertl-trace-writer': [zstd],
+  }
+endif
 
 if have_system or have_tools
   tests += {

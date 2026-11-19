@@ -16,6 +16,8 @@
 
 #include <qemu-plugin.h>
 
+#include "plugin_icount_range.h"
+
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 /* Scoreboard to track executed instructions count */
@@ -29,6 +31,7 @@ static qemu_plugin_u64 current_pc;
 
 static uint64_t icount;
 static int icount_exit_code;
+static PluginIcountRange icount_range;
 
 static bool exit_on_icount;
 static bool exit_on_address;
@@ -51,8 +54,16 @@ static void exit_emulation(int return_code, char *message)
 static void exit_icount_reached(unsigned int cpu_index, void *udata)
 {
     uint64_t insn_vaddr = qemu_plugin_u64_get(current_pc, cpu_index);
-    char *msg = g_strdup_printf("icount reached at 0x%" PRIx64 ", exiting\n",
-                                insn_vaddr);
+    char *msg;
+
+    if (icount_range.enabled) {
+        msg = g_strdup_printf("interval end reached at 0x%" PRIx64
+                              " (end_icount=%" PRIu64 "), exiting\n",
+                              insn_vaddr, icount_range.end_icount);
+    } else {
+        msg = g_strdup_printf("icount reached at 0x%" PRIx64 ", exiting\n",
+                              insn_vaddr);
+    }
     exit_emulation(icount_exit_code, msg);
 }
 
@@ -103,7 +114,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                                            const qemu_info_t *info, int argc,
                                            char **argv)
 {
+    PluginIcountRangeParseState range_parse_state;
+
     addrs_ht = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
+    plugin_icount_range_parse_state_init(&range_parse_state);
 
     insn_count_sb = qemu_plugin_scoreboard_new(sizeof(InstructionsCount));
     insn_count = qemu_plugin_scoreboard_u64_in_struct(
@@ -114,8 +128,29 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     for (int i = 0; i < argc; i++) {
         char *opt = argv[i];
         g_auto(GStrv) tokens = g_strsplit(opt, "=", 2);
+        char *range_err = NULL;
+        PluginIcountRangeParseResult range_rc;
+
+        range_rc = plugin_icount_range_parse_option(&range_parse_state,
+                                                    tokens[0], tokens[1],
+                                                    &range_err);
+        if (range_rc == PLUGIN_ICOUNT_RANGE_PARSE_ERROR) {
+            fprintf(stderr, "option parsing failed: %s\n", range_err);
+            g_free(range_err);
+            return -1;
+        }
+        if (range_rc == PLUGIN_ICOUNT_RANGE_PARSE_HANDLED) {
+            continue;
+        }
+
         if (g_strcmp0(tokens[0], "icount") == 0) {
             g_auto(GStrv) icount_tokens = g_strsplit(tokens[1], ":", 2);
+            if (plugin_icount_range_has_any_option(&range_parse_state)) {
+                fprintf(stderr,
+                        "option parsing failed: icount cannot be combined "
+                        "with interval gating options\n");
+                return -1;
+            }
             icount = g_ascii_strtoull(icount_tokens[0], NULL, 0);
             if (icount < 1 || g_strrstr(icount_tokens[0], "-") != NULL) {
                 fprintf(stderr,
@@ -142,6 +177,28 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             fprintf(stderr, "option parsing failed: %s\n", opt);
             return -1;
         }
+    }
+
+    {
+        char *range_err = NULL;
+
+        if (plugin_icount_range_finalize(&range_parse_state, &icount_range,
+                                         &range_err) < 0) {
+            fprintf(stderr, "option parsing failed: %s\n", range_err);
+            g_free(range_err);
+            return -1;
+        }
+    }
+
+    if (icount_range.enabled) {
+        if (exit_on_icount) {
+            fprintf(stderr,
+                    "option parsing failed: icount cannot be combined "
+                    "with interval gating options\n");
+            return -1;
+        }
+        icount = icount_range.end_icount;
+        exit_on_icount = true;
     }
 
     if (!exit_on_icount && !exit_on_address) {

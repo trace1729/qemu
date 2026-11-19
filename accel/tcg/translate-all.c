@@ -241,6 +241,9 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 {
     int ret = sigsetjmp(tcg_ctx->jmp_trans, 0);
     if (unlikely(ret != 0)) {
+        tcg_ctx->cpu = NULL;
+        tcg_ctx->plugin_db = NULL;
+        tcg_ctx->plugin_insn = NULL;
         return ret;
     }
 
@@ -251,10 +254,13 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     cs->cc->tcg_ops->translate_code(cs, tb, max_insns, pc, host_pc);
 
     assert(tb->size != 0);
-    tcg_ctx->cpu = NULL;
     *max_insns = tb->icount;
 
-    return tcg_gen_code(tcg_ctx, tb, pc);
+    ret = tcg_gen_code(tcg_ctx, tb, pc);
+    tcg_ctx->cpu = NULL;
+    tcg_ctx->plugin_db = NULL;
+    tcg_ctx->plugin_insn = NULL;
+    return ret;
 }
 
 /* Called with mmap_lock held for user mode emulation.  */
