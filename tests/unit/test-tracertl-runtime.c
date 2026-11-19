@@ -109,6 +109,86 @@ static void test_finalize_branch_sets_resolved_not_taken_target(void)
     g_assert_cmphex(recs[0].target, ==, 0x1010);
 }
 
+static void test_guest_conditional_branch_placeholder_matches_direction(void)
+{
+    g_assert_cmphex(tracertl_guest_conditional_branch_placeholder(true),
+                    ==, 0x00000063U);
+    g_assert_cmphex(tracertl_guest_conditional_branch_placeholder(false),
+                    ==, 0x00001063U);
+}
+
+static void test_demote_sequential_branch_clears_metadata(void)
+{
+    struct TraceInstructionC rec;
+
+    trace_instruction_init(&rec);
+    rec.instr_pc_va = 0x1000;
+    rec.instr = 0x0040006fU;
+    rec.target = 0x1004;
+    rec.branch_type = 2;
+    rec.branch_taken = 1;
+
+    g_assert_true(tracertl_demote_branch_if_sequential(&rec, 0x1004));
+    g_assert_cmphex(rec.instr, ==, tracertl_guest_non_branch_placeholder());
+    g_assert_cmpuint(rec.branch_type, ==, 0);
+    g_assert_cmpuint(rec.branch_taken, ==, 0);
+    g_assert_cmphex(rec.target, ==, 0);
+}
+
+static void test_demote_sequential_branch_preserves_nonseq(void)
+{
+    struct TraceInstructionC rec;
+
+    trace_instruction_init(&rec);
+    rec.instr = 0x0080006fU;
+    rec.target = 0x1008;
+    rec.branch_type = 2;
+    rec.branch_taken = 1;
+
+    g_assert_false(tracertl_demote_branch_if_sequential(&rec, 0x1004));
+    g_assert_cmphex(rec.instr, ==, 0x0080006fU);
+    g_assert_cmpuint(rec.branch_type, ==, 2);
+    g_assert_cmpuint(rec.branch_taken, ==, 1);
+    g_assert_cmphex(rec.target, ==, 0x1008);
+}
+
+static void test_encode_branch_placeholder_targets_forward_and_backward(void)
+{
+    uint32_t insn = 0;
+    uint64_t target = 0;
+
+    g_assert_true(tracertl_rv_encode_branch_to_target(0x1000, 0x1010,
+                                                      true, &insn));
+    g_assert_cmphex(insn, ==, 0x00000863U);
+    g_assert_true(tracertl_resolve_riscv_conditional_branch_target(
+        0x1000, insn, &target));
+    g_assert_cmphex(target, ==, 0x1010);
+
+    g_assert_true(tracertl_rv_encode_branch_to_target(0x1010, 0x1000,
+                                                      false, &insn));
+    g_assert_cmphex(insn, ==, 0xfe0018e3U);
+    g_assert_true(tracertl_resolve_riscv_conditional_branch_target(
+        0x1010, insn, &target));
+    g_assert_cmphex(target, ==, 0x1000);
+}
+
+static void test_encode_branch_placeholder_rejects_out_of_range(void)
+{
+    uint32_t insn = 0xdeadbeefU;
+
+    g_assert_false(tracertl_rv_encode_branch_to_target(0x1000, 0x3000,
+                                                       true, &insn));
+    g_assert_cmphex(insn, ==, 0xdeadbeefU);
+}
+
+static void test_encode_jal_placeholder_target(void)
+{
+    uint32_t insn = 0;
+
+    g_assert_true(tracertl_rv_encode_jal_to_target(0x1000, 0x3000, &insn));
+    g_assert_cmphex(insn, ==, 0x0000206fU);
+}
+
 static void test_finalize_branch_ignores_missing_record(void)
 {
     struct TraceInstructionC recs[1];
@@ -251,6 +331,18 @@ int main(int argc, char **argv)
                     test_finalize_branch_keeps_fallthrough_clear);
     g_test_add_func("/tracertl/runtime/finalize-branch-not-taken-target",
                     test_finalize_branch_sets_resolved_not_taken_target);
+    g_test_add_func("/tracertl/runtime/guest-conditional-branch-placeholder",
+                    test_guest_conditional_branch_placeholder_matches_direction);
+    g_test_add_func("/tracertl/runtime/demote-sequential-branch",
+                    test_demote_sequential_branch_clears_metadata);
+    g_test_add_func("/tracertl/runtime/demote-sequential-branch-preserves-nonseq",
+                    test_demote_sequential_branch_preserves_nonseq);
+    g_test_add_func("/tracertl/runtime/encode-branch-placeholder-targets",
+                    test_encode_branch_placeholder_targets_forward_and_backward);
+    g_test_add_func("/tracertl/runtime/encode-branch-placeholder-rejects-out-of-range",
+                    test_encode_branch_placeholder_rejects_out_of_range);
+    g_test_add_func("/tracertl/runtime/encode-jal-placeholder-target",
+                    test_encode_jal_placeholder_target);
     g_test_add_func("/tracertl/runtime/finalize-branch-missing-record",
                     test_finalize_branch_ignores_missing_record);
     g_test_add_func("/tracertl/runtime/resolve-riscv-conditional-branch-target",

@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,10 +29,8 @@ typedef enum {
     TRACERTL_MODE_HOT,
 } TracertlMode;
 
-static char *output_path = NULL;
-static char *sidecar_output_path = NULL;
-static char *stats_output_path = NULL;
 static int compression_level = 3;
+static bool pc_tag_binary = false;
 static bool is_riscv_guest = false;
 static bool is_riscv32_guest = false;
 static bool is_x86_guest = false;
@@ -39,22 +38,24 @@ static bool is_x86_64_guest = false;
 static bool is_aarch64_guest = false;
 static bool is_system_emulation = false;
 static qemu_plugin_id_t tracertl_plugin_id;
-static bool writer_failed = false;
+
 static PluginIcountRange trace_range;
+typedef struct {
+    PluginIcountRange range;
+    unsigned point;
+} SelectedThreadRange;
+static GHashTable *selected_thread_ranges;
+static char *selected_ranges_path;
 static TracertlMode tracertl_mode = TRACERTL_MODE_HOT;
 static uint64_t activation_margin = UINT64_C(20000000);
 static uint64_t hot_begin;
 static bool reset_requested = false;
-static bool hot_begin_logged = false;
-static bool range_end_logged = false;
 
-static TraceWriter *trace_writer;
-static TracertlPcTagSidecarWriter *sidecar_writer;
-static uint64_t next_sidecar_pc;
 static GMutex writer_lock;
 static struct qemu_plugin_scoreboard *vcpu_sb;
 
 typedef struct {
+    uint64_t thread_instructions;
     uint64_t guest_instructions;
     uint64_t guest_executed_bytes;
     uint64_t emitting_tcg_ops;
@@ -65,8 +66,34 @@ typedef struct {
     bool entry_from_outside;
 } TracertlTraceStats;
 
-static TracertlTraceStats trace_stats;
+/* Each guest thread lifetime owns its writer, PC tags and counters. */
+typedef struct {
+    char *output_path;
+    char *sidecar_output_path;
+    char *stats_output_path;
+    bool writer_failed;
+    bool hot_begin_logged;
+    bool range_end_logged;
+    TraceWriter *trace_writer;
+    TracertlPcTagSidecarWriter *sidecar_writer;
+    uint64_t next_sidecar_pc;
+    TracertlTraceStats trace_stats;
+} TraceStream;
+static TraceStream default_stream;
+static __thread TraceStream *bound_stream;
+static bool split_threads;
+static bool fork_child;
 
+/* The capture scope is the launched process and its threads. */
+static void detach_fork_child(void)
+{
+    fork_child = true;
+}
+
+static TraceStream *stream(void)
+{
+    return bound_stream ? bound_stream : &default_stream;
+}
 /* Track allocated InsnData objects so they can be freed on TB flush/exit */
 static GPtrArray *insn_data_list;
 static GMutex insn_data_lock;
@@ -74,18 +101,91 @@ static qemu_plugin_u64 retired_exec_count_entry;
 
 static void tracertl_trace_stats_reset(void)
 {
-    memset(&trace_stats, 0, sizeof(trace_stats));
-    hot_begin_logged = false;
-    range_end_logged = false;
+    memset(&stream()->trace_stats, 0, sizeof(stream()->trace_stats));
+    stream()->hot_begin_logged = false;
+    stream()->range_end_logged = false;
     if (trace_range.enabled) {
-        trace_stats.range_start_icount = trace_range.start_icount;
-        trace_stats.range_end_icount = trace_range.end_icount;
+        stream()->trace_stats.range_start_icount = trace_range.start_icount;
+        stream()->trace_stats.range_end_icount = trace_range.end_icount;
     }
+}
+
+static bool tracertl_parse_range_u64(const char *text, uint64_t *value)
+{
+    char *end = NULL;
+    errno = 0;
+    *value = g_ascii_strtoull(text, &end, 10);
+    return errno == 0 && end != text && *end == '\0';
+}
+
+static bool tracertl_load_thread_ranges(const char *path)
+{
+    gchar *contents = NULL;
+    gsize length = 0;
+    gchar **lines;
+
+    if (!g_file_get_contents(path, &contents, &length, NULL)) {
+        fprintf(stderr, "tracertl: failed to read thread_ranges=%s\n", path);
+        return false;
+    }
+    selected_thread_ranges = g_hash_table_new_full(
+        g_direct_hash, g_direct_equal, NULL, (GDestroyNotify)g_ptr_array_unref);
+    lines = g_strsplit(contents, "\n", -1);
+    for (size_t i = 0; lines[i]; i++) {
+        gchar **fields;
+        guint64 vcpu, start, end, point;
+        SelectedThreadRange *range;
+        GPtrArray *ranges;
+
+        if (!lines[i][0] || lines[i][0] == '#') {
+            continue;
+        }
+        fields = g_strsplit(lines[i], ",", 4);
+        if (!fields[0] || !fields[1] || !fields[2] || !fields[3] ||
+            !tracertl_parse_range_u64(fields[0], &vcpu) ||
+            !tracertl_parse_range_u64(fields[1], &start) ||
+            !tracertl_parse_range_u64(fields[2], &end) ||
+            !tracertl_parse_range_u64(fields[3], &point) ||
+            vcpu > G_MAXUINT || point > G_MAXUINT || start >= end) {
+            fprintf(stderr, "tracertl: invalid thread range at line %zu\n", i + 1);
+            g_strfreev(fields);
+            g_strfreev(lines);
+            g_free(contents);
+            return false;
+        }
+        ranges = g_hash_table_lookup(selected_thread_ranges,
+                                     GUINT_TO_POINTER((guint)vcpu + 1));
+        if (!ranges) {
+            ranges = g_ptr_array_new_with_free_func(g_free);
+            g_hash_table_insert(selected_thread_ranges,
+                                GUINT_TO_POINTER((guint)vcpu + 1), ranges);
+        }
+        if (ranges->len) {
+            SelectedThreadRange *previous = g_ptr_array_index(ranges, ranges->len - 1);
+            if (start < previous->range.end_icount) {
+                fprintf(stderr, "tracertl: thread ranges overlap or are unsorted at line %zu\n", i + 1);
+                g_strfreev(fields);
+                g_strfreev(lines);
+                g_free(contents);
+                return false;
+            }
+        }
+        range = g_new0(SelectedThreadRange, 1);
+        range->range.enabled = true;
+        range->range.start_icount = start;
+        range->range.end_icount = end;
+        range->point = (unsigned)point;
+        g_ptr_array_add(ranges, range);
+        g_strfreev(fields);
+    }
+    g_strfreev(lines);
+    g_free(contents);
+    return true;
 }
 
 static bool tracertl_should_start_hot_immediately(void)
 {
-    return !trace_range.enabled || hot_begin <= 1;
+    return split_threads || !trace_range.enabled || hot_begin <= 1;
 }
 
 static bool tracertl_parse_u64_option(const char *name,
@@ -123,50 +223,66 @@ static void tracertl_cleanup_global_state(void)
         vcpu_sb = NULL;
         retired_exec_count_entry = (qemu_plugin_u64){ 0 };
     }
-    g_free(output_path);
-    output_path = NULL;
-    g_free(sidecar_output_path);
-    sidecar_output_path = NULL;
-    g_free(stats_output_path);
-    stats_output_path = NULL;
+    g_free(stream()->output_path);
+    stream()->output_path = NULL;
+    g_free(stream()->sidecar_output_path);
+    stream()->sidecar_output_path = NULL;
+    g_free(stream()->stats_output_path);
+    stream()->stats_output_path = NULL;
+    if (selected_thread_ranges) {
+        g_hash_table_unref(selected_thread_ranges);
+        selected_thread_ranges = NULL;
+    }
+    g_clear_pointer(&selected_ranges_path, g_free);
 }
 
 static int tracertl_prepare_output_paths(void)
 {
-    if (!output_path) {
-        output_path = g_strdup("trace.trace.zstd");
+    if (!stream()->output_path) {
+        stream()->output_path = g_strdup("trace.trace.zstd");
     }
-    if (!output_path) {
+    if (!stream()->output_path) {
         return -1;
     }
 
-    g_free(sidecar_output_path);
-    sidecar_output_path = g_strdup_printf("%s.pc-tags.csv", output_path);
-    g_free(stats_output_path);
-    stats_output_path = g_strdup_printf("%s.stats.json", output_path);
+    g_free(stream()->sidecar_output_path);
+    stream()->sidecar_output_path = g_strdup_printf(
+        "%s.%s", stream()->output_path,
+        pc_tag_binary ? "pc-tags.bin" : "pc-tags.csv");
+    g_free(stream()->stats_output_path);
+    stream()->stats_output_path = g_strdup_printf("%s.stats.json", stream()->output_path);
 
-    return sidecar_output_path && stats_output_path ? 0 : -1;
+    return stream()->sidecar_output_path && stream()->stats_output_path ? 0 : -1;
 }
 
 static int tracertl_open_writer_locked(void)
 {
-    if (trace_writer || sidecar_writer) {
+    if (stream()->trace_writer || stream()->sidecar_writer) {
         return 0;
     }
 
-    trace_writer = trace_writer_open(output_path, compression_level);
-    if (!trace_writer) {
+    stream()->trace_writer = trace_writer_open(stream()->output_path, compression_level);
+    if (!stream()->trace_writer) {
         return -1;
     }
 
-    sidecar_writer = tracertl_pc_tag_sidecar_open(sidecar_output_path);
-    if (!sidecar_writer) {
-        trace_writer_close(trace_writer);
-        trace_writer = NULL;
+    if (split_threads) {
+        setvbuf(stream()->trace_writer->fp, NULL, _IOFBF, 1024 * 1024);
+    }
+    if (pc_tag_binary) {
+        stream()->sidecar_writer = tracertl_pc_tag_sidecar_open_binary_mode(
+            stream()->sidecar_output_path, false);
+    } else {
+        stream()->sidecar_writer = tracertl_pc_tag_sidecar_open_mode(
+            stream()->sidecar_output_path, false);
+    }
+    if (!stream()->sidecar_writer) {
+        trace_writer_close(stream()->trace_writer);
+        stream()->trace_writer = NULL;
         return -1;
     }
 
-    next_sidecar_pc = 0;
+    stream()->next_sidecar_pc = 0;
     return 0;
 }
 
@@ -199,19 +315,25 @@ static int tracertl_write_stats_file(const char *path)
         return -1;
     }
 
-    trace_emitted_rv_bytes = trace_stats.trace_emitted_rv_records * 4;
-    code_inflation_rate = trace_stats.emitting_tcg_ops == 0
+    trace_emitted_rv_bytes = stream()->trace_stats.trace_emitted_rv_records * 4;
+    code_inflation_rate = stream()->trace_stats.emitting_tcg_ops == 0
         ? 0.0
-        : (double)trace_stats.trace_emitted_rv_records /
-          (double)trace_stats.emitting_tcg_ops;
+        : (double)stream()->trace_stats.trace_emitted_rv_records /
+          (double)stream()->trace_stats.emitting_tcg_ops;
 
     fp = fopen(path, "w");
     if (!fp) {
         return -1;
     }
 
-    if (fprintf(fp,
-                "{\n"
+    if (fputs("{\n", fp) == EOF ||
+        (split_threads && fprintf(fp, "  \"thread_instructions\": %" PRIu64 ",\n",
+                                  stream()->trace_stats.thread_instructions) < 0) ||
+        (selected_ranges_path && fprintf(fp, "  \"window_complete\": %s,\n",
+             stream()->trace_stats.thread_instructions ==
+             stream()->trace_stats.range_end_icount - stream()->trace_stats.range_start_icount
+             ? "true" : "false") < 0) ||
+        fprintf(fp,
                 "  \"metric_mode\": \"rv-per-emitting-tcg-op\",\n"
                 "  \"guest_instructions\": %" PRIu64 ",\n"
                 "  \"guest_executed_bytes\": %" PRIu64 ",\n"
@@ -225,17 +347,17 @@ static int tracertl_write_stats_file(const char *path)
                 "  \"entry_from_outside\": %s,\n"
                 "  \"entry_pc\": %" PRIu64 "\n"
                 "}\n",
-                trace_stats.guest_instructions,
-                trace_stats.guest_executed_bytes,
-                trace_stats.emitting_tcg_ops,
-                trace_stats.trace_emitted_rv_records,
+                stream()->trace_stats.guest_instructions,
+                stream()->trace_stats.guest_executed_bytes,
+                stream()->trace_stats.emitting_tcg_ops,
+                stream()->trace_stats.trace_emitted_rv_records,
                 trace_emitted_rv_bytes,
                 code_inflation_rate,
-                trace_stats.guest_instructions,
-                trace_stats.range_start_icount,
-                trace_stats.range_end_icount,
-                trace_stats.entry_from_outside ? "true" : "false",
-                trace_stats.entry_pc) < 0) {
+                stream()->trace_stats.guest_instructions,
+                stream()->trace_stats.range_start_icount,
+                stream()->trace_stats.range_end_icount,
+                stream()->trace_stats.entry_from_outside ? "true" : "false",
+                stream()->trace_stats.entry_pc) < 0) {
         fclose(fp);
         return -1;
     }
@@ -718,6 +840,54 @@ typedef struct {
     GPtrArray *idata;
 } TracertlDeferredTB;
 
+static uint32_t tracertl_guest_branch_placeholder(uint8_t branch_type)
+{
+    switch (branch_type) {
+    case 1:
+        return tracertl_guest_conditional_branch_placeholder(true);
+    case 2:
+        return 0x0000006fU; /* jal x0, 0 */
+    case 3:
+        return 0x00000067U; /* jalr x0, 0(x0) */
+    default:
+        return 0;
+    }
+}
+
+static bool tracertl_is_translated_cond_branch_placeholder(uint32_t insn)
+{
+    return insn == tracertl_guest_conditional_branch_placeholder(true) ||
+           insn == tracertl_guest_conditional_branch_placeholder(false);
+}
+
+static void tracertl_normalize_translated_guest_cflow(InsnData *idata,
+                                                      uint16_t emitted_n)
+{
+    g_assert(idata != NULL);
+
+    for (uint16_t j = 0; j < emitted_n; j++) {
+        bool is_guest_branch_record =
+            idata->guest_branch_type != 0 &&
+            idata->branch_rv_idx >= 0 &&
+            j == (uint16_t)idata->branch_rv_idx;
+
+        if (is_guest_branch_record) {
+            idata->rv_insns[j] =
+                tracertl_guest_branch_placeholder(idata->guest_branch_type);
+            idata->rv_tags[j] = idata->guest_branch_type == 3
+                ? QEMU_PLUGIN_RV_TAG_INDIRECT_BRANCH_PLACEHOLDER
+                : QEMU_PLUGIN_RV_TAG_NONE;
+        } else if (rv_branch_type(idata->rv_insns[j]) != 0 &&
+                   idata->rv_tags[j] != QEMU_PLUGIN_RV_TAG_MOVCOND) {
+            /* Tagged movcond branches describe the internal lowering window;
+             * they are not guest control flow and retain their sidecar tag. */
+            idata->rv_insns[j] = tracertl_guest_non_branch_placeholder();
+            idata->rv_tags[j] =
+                QEMU_PLUGIN_RV_TAG_GENERIC_DEPENDENCY_PLACEHOLDER;
+        }
+    }
+}
+
 static void insn_data_destroy(gpointer ptr)
 {
     InsnData *d = ptr;
@@ -821,6 +991,9 @@ static void insn_data_discard(InsnData *d)
 
 static void vcpu_tb_flush_cb(qemu_plugin_id_t id)
 {
+    if (fork_child) {
+        return;
+    }
     insn_data_free_all();
 }
 
@@ -858,6 +1031,11 @@ static void tracertl_deferred_tb_destroy(gpointer ptr)
  * pending expansion. Memory callbacks patch that pending group in between.
  */
 typedef struct {
+    TraceStream *thread_stream;
+    unsigned generation;
+    GPtrArray *selected_ranges;
+    unsigned selected_range_index;
+    SelectedThreadRange *active_selected_range;
     uint64_t retired_exec_count; /* 1-based count at insn exec callback time */
     uint64_t expected_next; /* sequential successor guest PC for branch resolution */
     uint16_t pending_guest_size; /* executed guest bytes for the pending group */
@@ -880,11 +1058,19 @@ typedef struct {
     int8_t   n_mem_slots;
     int8_t   mem_slot_idxs[QEMU_PLUGIN_RV_MAX_MEM];
     int8_t   mem_cursor;  /* next mem slot to fill */
+    int8_t   mem_slots_filled;
     int8_t   branch_rec_idx;
     int8_t   exception_rec_idx;
     bool     current_insn_traced;
     bool     has_pending;
 } VCPUState;
+
+static int tracertl_begin_selected_range(VCPUState *state,
+                                        unsigned vcpu_index,
+                                        SelectedThreadRange *range);
+static int tracertl_end_selected_range_locked(VCPUState *state);
+static int tracertl_close_writer_locked(void);
+static void flush_pending(VCPUState *state);
 
 static VCPUState *get_vcpu_state(unsigned int vcpu_index)
 {
@@ -902,6 +1088,55 @@ static void vcpu_state_ensure_cap(VCPUState *state, int need)
     state->pending_tags = g_realloc(state->pending_tags,
                                     cap * sizeof(uint8_t));
     state->pending_cap = cap;
+}
+
+static int tracertl_begin_selected_range(VCPUState *state,
+                                        unsigned vcpu_index,
+                                        SelectedThreadRange *range)
+{
+    TraceStream *thread = state->thread_stream;
+
+    bound_stream = thread;
+    thread->output_path = g_strdup_printf("%s.t%u.g%u.p%u.trace.%s",
+                                          default_stream.output_path,
+                                          vcpu_index, state->generation,
+                                          range->point,
+                                          compression_level == 0 ? "raw" : "zstd");
+    thread->writer_failed = false;
+    thread->hot_begin_logged = false;
+    thread->range_end_logged = false;
+    thread->next_sidecar_pc = 0;
+    memset(&thread->trace_stats, 0, sizeof(thread->trace_stats));
+    thread->trace_stats.range_start_icount = range->range.start_icount;
+    thread->trace_stats.range_end_icount = range->range.end_icount;
+    if (tracertl_prepare_output_paths() < 0 || tracertl_open_writer() < 0) {
+        fprintf(stderr, "tracertl: failed to open selected trace %s\n",
+                thread->output_path);
+        return -1;
+    }
+    state->active_selected_range = range;
+    return 0;
+}
+
+static int tracertl_end_selected_range_locked(VCPUState *state)
+{
+    TraceStream *thread = stream();
+    flush_pending(state);
+    int ret = tracertl_close_writer_locked();
+
+    thread->trace_stats.thread_instructions =
+        MIN(state->retired_exec_count, thread->trace_stats.range_end_icount) -
+        thread->trace_stats.range_start_icount;
+    if (thread->writer_failed || tracertl_write_stats_file(thread->stats_output_path) < 0) {
+        ret = -1;
+    }
+    g_free(thread->output_path);
+    g_free(thread->sidecar_output_path);
+    g_free(thread->stats_output_path);
+    thread->output_path = NULL;
+    thread->sidecar_output_path = NULL;
+    thread->stats_output_path = NULL;
+    return ret;
 }
 
 static void tracertl_discard_pending_state(VCPUState *state)
@@ -976,6 +1211,35 @@ static void apply_mem_to_overflow_slot(VCPUState *state,
     state->pending_tags[slot_idx] = QEMU_PLUGIN_RV_TAG_NONE;
 }
 
+static void patch_translated_cond_branch_placeholder(VCPUState *state)
+{
+    struct TraceInstructionC *branch_rec;
+
+    if (is_riscv_guest ||
+        state->branch_rec_idx < 0 ||
+        state->branch_rec_idx >= state->n_pending) {
+        return;
+    }
+
+    branch_rec = &state->pending_recs[state->branch_rec_idx];
+    if (branch_rec->branch_type == 1 ||
+        branch_rec->branch_type == 2 ||
+        branch_rec->branch_type == 3 ||
+        tracertl_is_translated_cond_branch_placeholder(branch_rec->instr)) {
+        if (tracertl_demote_branch_if_sequential(
+                branch_rec, branch_rec->instr_pc_va + state->pending_guest_size)) {
+            return;
+        }
+        /* These are still guest PCs: x86 targets can be odd or outside RV
+         * immediate range. Preserve guest branch class here; the remapper
+         * encodes the final aligned synthetic PC/target pair. */
+        if (branch_rec->branch_type == 1) {
+            branch_rec->instr = tracertl_guest_conditional_branch_placeholder(
+                branch_rec->branch_taken != 0);
+        }
+    }
+}
+
 static void finalize_pending_branch(VCPUState *state,
                                     uint64_t actual_next_pc,
                                     uint64_t actual_next_trace_pc)
@@ -1004,6 +1268,7 @@ static void finalize_pending_branch(VCPUState *state,
                              state->branch_rec_idx, state->expected_next,
                              actual_next_pc, actual_next_trace_pc,
                              resolved_branch_target);
+    patch_translated_cond_branch_placeholder(state);
 }
 
 static void finalize_pending_exception(VCPUState *state,
@@ -1108,22 +1373,22 @@ static int tracertl_close_writer_locked(void)
 {
     int ret;
 
-    if (!trace_writer && !sidecar_writer) {
+    if (!stream()->trace_writer && !stream()->sidecar_writer) {
         return 0;
     }
 
     ret = 0;
-    if (trace_writer) {
-        if (trace_writer_close(trace_writer) < 0) {
+    if (stream()->trace_writer) {
+        if (trace_writer_close(stream()->trace_writer) < 0) {
             ret = -1;
         }
-        trace_writer = NULL;
+        stream()->trace_writer = NULL;
     }
-    if (sidecar_writer) {
-        if (tracertl_pc_tag_sidecar_close(sidecar_writer) < 0) {
+    if (stream()->sidecar_writer) {
+        if (tracertl_pc_tag_sidecar_close(stream()->sidecar_writer) < 0) {
             ret = -1;
         }
-        sidecar_writer = NULL;
+        stream()->sidecar_writer = NULL;
     }
     return ret;
 }
@@ -1142,11 +1407,11 @@ static void tracertl_mark_writer_failed(void)
 {
     int ret;
 
-    if (writer_failed) {
+    if (stream()->writer_failed) {
         return;
     }
 
-    writer_failed = true;
+    stream()->writer_failed = true;
     fprintf(stderr, "tracertl: error writing trace output, disabling plugin\n");
     ret = tracertl_close_writer_locked();
     if (ret < 0) {
@@ -1157,39 +1422,39 @@ static void tracertl_mark_writer_failed(void)
 
 static void write_pending_records(VCPUState *state)
 {
-    if (writer_failed) {
+    if (stream()->writer_failed) {
         tracertl_discard_pending_state(state);
         return;
     }
 
-    if (trace_stats.entry_pc == 0 && state->n_pending > 0) {
-        trace_stats.entry_pc = state->pending_recs[0].instr_pc_va;
-        trace_stats.entry_from_outside =
+    if (stream()->trace_stats.entry_pc == 0 && state->n_pending > 0) {
+        stream()->trace_stats.entry_pc = state->pending_recs[0].instr_pc_va;
+        stream()->trace_stats.entry_from_outside =
             trace_range.enabled && trace_range.start_icount > 0;
     }
 
     for (int i = 0; i < state->n_pending; i++) {
-        uint64_t sidecar_pc = next_sidecar_pc;
+        uint64_t sidecar_pc = stream()->next_sidecar_pc;
 
-        if (trace_writer_write(trace_writer, &state->pending_recs[i]) < 0) {
+        if (trace_writer_write(stream()->trace_writer, &state->pending_recs[i]) < 0) {
             tracertl_mark_writer_failed();
             break;
         }
-        if (sidecar_writer &&
+        if (stream()->sidecar_writer &&
             state->pending_tags[i] != QEMU_PLUGIN_RV_TAG_NONE &&
-            tracertl_pc_tag_sidecar_note(sidecar_writer,
+            tracertl_pc_tag_sidecar_note(stream()->sidecar_writer,
                                          sidecar_pc,
                                          (qemu_plugin_rv_trace_tag)state->pending_tags[i]) < 0) {
             tracertl_mark_writer_failed();
             break;
         }
-        next_sidecar_pc += 4;
+        stream()->next_sidecar_pc += 4;
     }
-    if (!writer_failed) {
-        trace_stats.guest_instructions++;
-        trace_stats.guest_executed_bytes += state->pending_guest_size;
-        trace_stats.emitting_tcg_ops += state->pending_emitting_tcg_ops;
-        trace_stats.trace_emitted_rv_records += (uint64_t)state->n_pending;
+    if (!stream()->writer_failed) {
+        stream()->trace_stats.guest_instructions++;
+        stream()->trace_stats.guest_executed_bytes += state->pending_guest_size;
+        stream()->trace_stats.emitting_tcg_ops += state->pending_emitting_tcg_ops;
+        stream()->trace_stats.trace_emitted_rv_records += (uint64_t)state->n_pending;
     }
     tracertl_discard_pending_state(state);
 }
@@ -1213,6 +1478,7 @@ static void flush_pending(VCPUState *state)
                                                state->branch_rec_idx,
                                                state->expected_next,
                                                terminal_target);
+    patch_translated_cond_branch_placeholder(state);
     finalize_pending_exception_without_successor(state, terminal_target);
     write_pending_records(state);
 }
@@ -1225,6 +1491,9 @@ static void vcpu_mem_cb(unsigned int vcpu_index,
                         qemu_plugin_meminfo_t info,
                         uint64_t vaddr, void *udata)
 {
+    if (fork_child) {
+        return;
+    }
     InsnData *idata = (InsnData *)udata;
     VCPUState *state = get_vcpu_state(vcpu_index);
     uint8_t mtype = qemu_plugin_mem_is_store(info)
@@ -1281,40 +1550,72 @@ static void vcpu_mem_cb(unsigned int vcpu_index,
 /* ------------------------------------------------------------------ */
 static void vcpu_insn_exec_cb(unsigned int vcpu_index, void *udata)
 {
+    if (fork_child) {
+        return;
+    }
     InsnData *idata = (InsnData *)udata;
     VCPUState *state = get_vcpu_state(vcpu_index);
     uint16_t n = idata->n_rv;
     uint64_t pc_pa = tracertl_insn_paddr(idata->pc);
     uint64_t actual_next_trace_pc = 0;
     uint64_t exec_count;
+    PluginIcountRange *active_range = &trace_range;
+    PluginIcountRange inactive_range = { 0 };
     bool current_in_range;
     bool previous_in_range;
     bool entering_range;
+    bool ending_selected_range = false;
     bool keep_pending = false;
 
+    if (split_threads) {
+        bound_stream = state->thread_stream;
+        g_assert(bound_stream);
+    }
     state->retired_exec_count++;
     exec_count = state->retired_exec_count;
+    if (split_threads && selected_ranges_path) {
+        g_assert(state->selected_ranges);
+        if (!state->active_selected_range &&
+            state->selected_range_index < state->selected_ranges->len) {
+            SelectedThreadRange *candidate = g_ptr_array_index(
+                state->selected_ranges, state->selected_range_index);
+            if (exec_count > candidate->range.start_icount &&
+                exec_count <= candidate->range.end_icount &&
+                tracertl_begin_selected_range(state, vcpu_index, candidate) < 0) {
+                g_error("tracertl: failed to start selected range");
+            }
+        }
+        if (state->active_selected_range) {
+            active_range = &state->active_selected_range->range;
+            ending_selected_range = exec_count > active_range->end_icount;
+        } else {
+            active_range = &inactive_range;
+        }
+    }
     if (trace_range.enabled &&
-        !hot_begin_logged &&
+        !stream()->hot_begin_logged &&
         hot_begin > 0 &&
         exec_count == hot_begin) {
-        hot_begin_logged = true;
+        stream()->hot_begin_logged = true;
         fprintf(stderr,
                 "tracertl: reached hot begin at guest icount=%" PRIu64 "\n",
                 exec_count);
     }
     if (trace_range.enabled &&
-        !range_end_logged &&
+        !stream()->range_end_logged &&
         exec_count == trace_range.end_icount) {
-        range_end_logged = true;
+        stream()->range_end_logged = true;
         fprintf(stderr,
                 "tracertl: reached range end at guest icount=%" PRIu64 "\n",
                 exec_count);
     }
-    current_in_range = plugin_icount_range_contains_exec(&trace_range,
-                                                         exec_count);
+    current_in_range = selected_ranges_path
+        ? (state->active_selected_range &&
+           plugin_icount_range_contains_exec(active_range, exec_count))
+        : plugin_icount_range_contains_exec(active_range, exec_count);
     previous_in_range = exec_count > 1 &&
-        plugin_icount_range_contains_exec(&trace_range, exec_count - 1);
+        ((!selected_ranges_path || state->active_selected_range) &&
+         plugin_icount_range_contains_exec(active_range, exec_count - 1));
     entering_range = current_in_range && !previous_in_range;
     state->current_insn_traced = false;
 
@@ -1322,12 +1623,16 @@ static void vcpu_insn_exec_cb(unsigned int vcpu_index, void *udata)
         tracertl_discard_pending_state(state);
     }
 
+    if (!state->has_pending && !current_in_range && !ending_selected_range) {
+        return;
+    }
+
     g_mutex_lock(&writer_lock);
 
     if (state->has_pending) {
         if (current_in_range) {
             actual_next_trace_pc = n > 0 ? idata->pc : 0;
-        } else if (trace_range.enabled) {
+        } else if (trace_range.enabled || selected_ranges_path) {
             /*
              * Interval exit keeps the real guest successor visible to the
              * last in-range instruction even though the successor itself is
@@ -1351,7 +1656,36 @@ static void vcpu_insn_exec_cb(unsigned int vcpu_index, void *udata)
         }
     }
 
+    if (ending_selected_range) {
+        if (tracertl_end_selected_range_locked(state) < 0) {
+            g_error("tracertl: failed to finish selected range");
+        }
+    }
     g_mutex_unlock(&writer_lock);
+
+    if (ending_selected_range) {
+        state->active_selected_range = NULL;
+        state->selected_range_index++;
+        if (state->selected_range_index < state->selected_ranges->len) {
+            SelectedThreadRange *next = g_ptr_array_index(
+                state->selected_ranges, state->selected_range_index);
+            if (exec_count > next->range.start_icount &&
+                exec_count <= next->range.end_icount &&
+                tracertl_begin_selected_range(state, vcpu_index, next) < 0) {
+                g_error("tracertl: failed to start next selected range");
+            }
+        }
+        current_in_range = state->active_selected_range &&
+            plugin_icount_range_contains_exec(
+                &state->active_selected_range->range, exec_count);
+        previous_in_range = state->active_selected_range && exec_count > 1 &&
+            plugin_icount_range_contains_exec(
+                &state->active_selected_range->range, exec_count - 1);
+        entering_range = current_in_range && !previous_in_range;
+        if (entering_range) {
+            tracertl_discard_pending_state(state);
+        }
+    }
 
     /* Install the current instruction's emitted RV records as the new pending
      * group. Branch, exception, and memory fields are completed later. */
@@ -1462,14 +1796,24 @@ static void tracertl_fill_translated_insn(
         idata->branch_rv_idx = meta[insn_idx].branch_idx;
 
         if (is_x86_guest || is_aarch64_guest) {
-            if (idata->guest_branch_type != 0 &&
-                idata->branch_rv_idx >= 0 &&
-                idata->branch_rv_idx < count) {
+            if (idata->guest_branch_type != 0) {
+                if (idata->branch_rv_idx < 0 ||
+                    idata->branch_rv_idx >= count) {
+                    insn_data_reserve(idata, emitted_n + 1);
+                    idata->branch_rv_idx = emitted_n;
+                    idata->rv_insns[emitted_n] =
+                        tracertl_guest_branch_placeholder(
+                            idata->guest_branch_type);
+                    idata->rv_tags[emitted_n] = QEMU_PLUGIN_RV_TAG_NONE;
+                    emitted_n++;
+                    idata->n_rv = emitted_n;
+                }
                 idata->branch_type_rv = idata->guest_branch_type;
             } else {
                 idata->branch_rv_idx = -1;
                 idata->branch_type_rv = 0;
             }
+            tracertl_normalize_translated_guest_cflow(idata, emitted_n);
 
             if (idata->guest_exception_code != 0) {
                 idata->exception_rv_idx =
@@ -1593,6 +1937,9 @@ static void cold_vcpu_tb_trans_cb(qemu_plugin_id_t id G_GNUC_UNUSED,
 static void hot_vcpu_tb_trans_cb(qemu_plugin_id_t id G_GNUC_UNUSED,
                                  struct qemu_plugin_tb *tb)
 {
+    if (fork_child) {
+        return;
+    }
     size_t n_insns = qemu_plugin_tb_n_insns(tb);
     TracertlDeferredTB *deferred = tracertl_deferred_tb_new(n_insns);
 
@@ -1751,7 +2098,7 @@ static int tracertl_enter_hot_mode(qemu_plugin_id_t id)
     int n_vcpus;
 
     tracertl_trace_stats_reset();
-    if (tracertl_open_writer() < 0) {
+    if (!split_threads && tracertl_open_writer() < 0) {
         return -1;
     }
 
@@ -1781,7 +2128,7 @@ static void after_hot_reset_cb(qemu_plugin_id_t id)
     if (tracertl_enter_hot_mode(id) < 0) {
         fprintf(stderr,
                 "tracertl: failed to activate hot tracing for %s\n",
-                output_path ? output_path : "(null)");
+                stream()->output_path ? stream()->output_path : "(null)");
         tracertl_cleanup_global_state();
         qemu_plugin_uninstall(tracertl_plugin_id, NULL);
         return;
@@ -1796,26 +2143,87 @@ static void after_hot_reset_cb(qemu_plugin_id_t id)
 /*  Lifecycle callbacks                                               */
 /* ------------------------------------------------------------------ */
 
+static void finish_thread_stream(VCPUState *state)
+{
+    bound_stream = state->thread_stream;
+    if (!bound_stream) {
+        return;
+    }
+    if (selected_ranges_path) {
+        if (state->active_selected_range &&
+            tracertl_end_selected_range_locked(state) < 0) {
+            g_error("tracertl: failed to finish selected trace at thread exit");
+        }
+        g_free(bound_stream);
+        bound_stream = NULL;
+        state->thread_stream = NULL;
+        state->active_selected_range = NULL;
+        return;
+    }
+    stream()->trace_stats.thread_instructions = state->retired_exec_count;
+    flush_pending(state);
+    if (tracertl_close_writer_locked() < 0 || stream()->writer_failed ||
+        tracertl_write_stats_file(stream()->stats_output_path) < 0) {
+        g_error("tracertl: failed to finish %s", stream()->output_path);
+    }
+    g_free(stream()->output_path);
+    g_free(stream()->sidecar_output_path);
+    g_free(stream()->stats_output_path);
+    g_free(bound_stream);
+    state->thread_stream = NULL;
+    bound_stream = NULL;
+}
+
 static void vcpu_exit_cb(qemu_plugin_id_t id G_GNUC_UNUSED,
                          unsigned int vcpu_index)
 {
+    if (fork_child) {
+        return;
+    }
     VCPUState *state = get_vcpu_state(vcpu_index);
     g_mutex_lock(&writer_lock);
-    flush_pending(state);
+    if (split_threads) {
+        finish_thread_stream(state);
+    } else {
+        flush_pending(state);
+    }
     g_mutex_unlock(&writer_lock);
 }
 
 static void vcpu_init_cb(qemu_plugin_id_t id G_GNUC_UNUSED,
                          unsigned int vcpu_index)
 {
+    if (fork_child) {
+        return;
+    }
     VCPUState *state = get_vcpu_state(vcpu_index);
 
     tracertl_reset_runtime_state(state);
+    if (split_threads) {
+        state->retired_exec_count = 0;
+        bound_stream = state->thread_stream = g_new0(TraceStream, 1);
+        state->generation++;
+        if (selected_ranges_path) {
+            state->selected_ranges = g_hash_table_lookup(
+                selected_thread_ranges, GUINT_TO_POINTER(vcpu_index + 1));
+            if (!state->selected_ranges) {
+                state->selected_ranges = g_ptr_array_new();
+            }
+        } else {
+            stream()->output_path = g_strdup_printf("%s.t%u.g%u.trace.zstd",
+                default_stream.output_path, vcpu_index, state->generation);
+            tracertl_trace_stats_reset();
+            if (tracertl_prepare_output_paths() < 0 || tracertl_open_writer() < 0) {
+                g_error("tracertl: failed to open %s", stream()->output_path);
+            }
+        }
+        return;
+    }
     if (qemu_plugin_num_vcpus() > 1) {
         int ret;
 
-        if (!writer_failed) {
-            writer_failed = true;
+        if (!stream()->writer_failed) {
+            stream()->writer_failed = true;
             fprintf(stderr,
                     "tracertl: multiple vCPU contexts are unsupported; disabling plugin\n");
             ret = tracertl_close_writer();
@@ -1830,9 +2238,21 @@ static void vcpu_init_cb(qemu_plugin_id_t id G_GNUC_UNUSED,
 static void plugin_exit_cb(qemu_plugin_id_t id G_GNUC_UNUSED,
                            void *userdata G_GNUC_UNUSED)
 {
+    if (fork_child) {
+        return;
+    }
     int ret = 0;
 
-    if (!trace_writer && !sidecar_writer) {
+    if (split_threads) {
+        g_mutex_lock(&writer_lock);
+        for (int i = 0; i < qemu_plugin_num_vcpus(); i++) {
+            finish_thread_stream(get_vcpu_state(i));
+        }
+        g_mutex_unlock(&writer_lock);
+        bound_stream = NULL;
+        goto cleanup;
+    }
+    if (!stream()->trace_writer && !stream()->sidecar_writer) {
         goto cleanup;
     }
 
@@ -1844,14 +2264,14 @@ static void plugin_exit_cb(qemu_plugin_id_t id G_GNUC_UNUSED,
     ret = tracertl_close_writer_locked();
     g_mutex_unlock(&writer_lock);
 
-    if (writer_failed || ret < 0) {
+    if (stream()->writer_failed || ret < 0) {
         fprintf(stderr, "tracertl: error closing trace output\n");
-    } else if (tracertl_write_stats_file(stats_output_path) < 0) {
+    } else if (tracertl_write_stats_file(stream()->stats_output_path) < 0) {
         fprintf(stderr, "tracertl: failed to write stats file %s\n",
-                stats_output_path ? stats_output_path : "(null)");
+                stream()->stats_output_path ? stream()->stats_output_path : "(null)");
     } else {
         fprintf(stderr, "tracertl: trace written to %s (sidecar=%s, stats=%s)\n",
-                output_path, sidecar_output_path, stats_output_path);
+                stream()->output_path, stream()->sidecar_output_path, stream()->stats_output_path);
     }
 
 cleanup:
@@ -1872,10 +2292,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     is_aarch64_guest = (strstr(info->target_name, "aarch64") != NULL);
     is_system_emulation = info->system_emulation;
     tracertl_plugin_id = id;
-    writer_failed = false;
-    trace_writer = NULL;
-    sidecar_writer = NULL;
-    next_sidecar_pc = 0;
+    stream()->writer_failed = false;
+    stream()->trace_writer = NULL;
+    stream()->sidecar_writer = NULL;
+    stream()->next_sidecar_pc = 0;
     tracertl_mode = TRACERTL_MODE_HOT;
     activation_margin = UINT64_C(20000000);
     hot_begin = 0;
@@ -1902,10 +2322,24 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         }
 
         if (g_strcmp0(tokens[0], "output") == 0 && tokens[1]) {
-            g_free(output_path);
-            output_path = g_strdup(tokens[1]);
+            g_free(stream()->output_path);
+            stream()->output_path = g_strdup(tokens[1]);
+        } else if (g_strcmp0(opt, "threads=split") == 0 && !is_system_emulation) {
+            split_threads = true;
+        } else if (g_strcmp0(tokens[0], "thread_ranges") == 0 && tokens[1]) {
+            selected_ranges_path = g_strdup(tokens[1]);
         } else if (g_strcmp0(tokens[0], "level") == 0 && tokens[1]) {
             compression_level = atoi(tokens[1]);
+        } else if (g_strcmp0(tokens[0], "pc_tags") == 0 && tokens[1]) {
+            if (g_strcmp0(tokens[1], "binary") == 0) {
+                pc_tag_binary = true;
+            } else if (g_strcmp0(tokens[1], "csv") == 0) {
+                pc_tag_binary = false;
+            } else {
+                fprintf(stderr, "tracertl: invalid pc_tags value '%s'\n", tokens[1]);
+                tracertl_cleanup_global_state();
+                return -1;
+            }
         } else if (g_strcmp0(tokens[0], "activation_margin") == 0) {
             if (!tracertl_parse_u64_option("activation_margin", tokens[1],
                                            &activation_margin)) {
@@ -1930,6 +2364,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             return -1;
         }
     }
+    if (selected_ranges_path &&
+        (!split_threads || trace_range.enabled ||
+         !tracertl_load_thread_ranges(selected_ranges_path) ||
+         g_hash_table_size(selected_thread_ranges) == 0)) {
+        fprintf(stderr, "tracertl: thread_ranges requires threads=split, valid ranges, and no global range\n");
+        tracertl_cleanup_global_state();
+        return -1;
+    }
     tracertl_trace_stats_reset();
 
     if (info->system_emulation && info->system.smp_vcpus > 1) {
@@ -1949,11 +2391,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 
     if (tracertl_prepare_output_paths() < 0) {
         fprintf(stderr, "tracertl: failed to prepare output paths for %s\n",
-                output_path ? output_path : "(null)");
+                stream()->output_path ? stream()->output_path : "(null)");
         tracertl_cleanup_global_state();
         return -1;
     }
 
+    if (split_threads && pthread_atfork(NULL, NULL, detach_fork_child) != 0) {
+        return -1;
+    }
     vcpu_sb = qemu_plugin_scoreboard_new(sizeof(VCPUState));
     if (!vcpu_sb) {
         fprintf(stderr, "tracertl: failed to allocate vcpu scoreboard\n");
@@ -1966,7 +2411,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 
     if (tracertl_should_start_hot_immediately()) {
         if (tracertl_enter_hot_mode(id) < 0) {
-            fprintf(stderr, "tracertl: failed to open %s\n", output_path);
+            fprintf(stderr, "tracertl: failed to open %s\n", stream()->output_path);
             tracertl_cleanup_global_state();
             return -1;
         }
@@ -1979,20 +2424,20 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         if (tracertl_should_start_hot_immediately()) {
             fprintf(stderr,
                     "tracertl: writing trace to %s (level=%d, guest=%s, interval=[%" PRIu64 ",%" PRIu64 "), hot_begin=%" PRIu64 ")\n",
-                    output_path, compression_level,
+                    stream()->output_path, compression_level,
                     is_riscv_guest ? "riscv" : info->target_name,
                     trace_range.start_icount, trace_range.end_icount,
                     hot_begin);
         } else {
             fprintf(stderr,
                     "tracertl: cold counting until hot_begin=%" PRIu64 " for %s (level=%d, guest=%s, interval=[%" PRIu64 ",%" PRIu64 "))\n",
-                    hot_begin, output_path, compression_level,
+                    hot_begin, stream()->output_path, compression_level,
                     is_riscv_guest ? "riscv" : info->target_name,
                     trace_range.start_icount, trace_range.end_icount);
         }
     } else {
         fprintf(stderr, "tracertl: writing trace to %s (level=%d, guest=%s)\n",
-                output_path, compression_level,
+                stream()->output_path, compression_level,
                 is_riscv_guest ? "riscv" : info->target_name);
     }
     return 0;

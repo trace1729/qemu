@@ -1,14 +1,15 @@
 /*
- * CSV sidecar writer for synthetic trace-PC provenance tags.
+ * Sidecar writer for synthetic trace-PC provenance tags.
  *
  * The writer accepts tagged 4-byte synthetic PCs in dynamic order,
  * suppresses duplicates, and coalesces adjacent PCs with the same tag into
- * half-open intervals written as:
+ * half-open intervals. The default output is CSV:
  *
  *   0xSTART_PC,0xEND_PC_EXCLUSIVE,tag_name
  *
- * Raw sidecar consumers can disambiguate this ordinal encoding from guest-PC
- * keyed sidecars via the emitted mode comment.
+ * Collection-time consumers may select a fixed-size binary representation to
+ * avoid text-formatting overhead. Raw sidecar consumers can disambiguate the
+ * ordinal encoding from guest-PC keyed sidecars via the emitted mode metadata.
  */
 #ifndef TRACERTL_PC_TAG_SIDECAR_H
 #define TRACERTL_PC_TAG_SIDECAR_H
@@ -22,6 +23,24 @@
 
 #include "qemu/qemu-plugin.h"
 
+#define TRACERTL_PC_TAG_SIDECAR_BINARY_MAGIC "TRPCTAG1"
+#define TRACERTL_PC_TAG_SIDECAR_BINARY_VERSION 1
+#define TRACERTL_PC_TAG_SIDECAR_MODE_ORDINAL 1
+
+typedef struct TracertlPcTagSidecarBinaryHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t mode;
+    uint32_t reserved;
+} TracertlPcTagSidecarBinaryHeader;
+
+typedef struct TracertlPcTagSidecarBinaryEntry {
+    uint64_t start;
+    uint64_t end;
+    uint32_t tag;
+    uint32_t reserved;
+} TracertlPcTagSidecarBinaryEntry;
+
 typedef struct TracertlPcTagSidecarWriter {
     FILE *fp;
     GHashTable *seen_pcs;
@@ -29,6 +48,7 @@ typedef struct TracertlPcTagSidecarWriter {
     uint64_t interval_end;
     qemu_plugin_rv_trace_tag interval_tag;
     bool have_interval;
+    bool binary;
     int status;
 } TracertlPcTagSidecarWriter;
 
@@ -57,9 +77,19 @@ static inline int tracertl_pc_tag_sidecar_flush_interval(
         return writer->status;
     }
 
-    if (fprintf(writer->fp, "0x%" PRIx64 ",0x%" PRIx64 ",%s\n",
-                writer->interval_start, writer->interval_end,
-                tracertl_pc_tag_name(writer->interval_tag)) < 0) {
+    if (writer->binary) {
+        TracertlPcTagSidecarBinaryEntry entry = {
+            .start = writer->interval_start,
+            .end = writer->interval_end,
+            .tag = (uint32_t)writer->interval_tag,
+            .reserved = 0,
+        };
+        if (fwrite(&entry, sizeof(entry), 1, writer->fp) != 1) {
+            writer->status = -1;
+        }
+    } else if (fprintf(writer->fp, "0x%" PRIx64 ",0x%" PRIx64 ",%s\n",
+                       writer->interval_start, writer->interval_end,
+                       tracertl_pc_tag_name(writer->interval_tag)) < 0) {
         writer->status = -1;
     }
 
@@ -67,23 +97,42 @@ static inline int tracertl_pc_tag_sidecar_flush_interval(
     return writer->status;
 }
 
-static inline TracertlPcTagSidecarWriter *tracertl_pc_tag_sidecar_open(
-    const char *path)
+static inline TracertlPcTagSidecarWriter *tracertl_pc_tag_sidecar_open_format(
+    const char *path, bool unbuffered, bool binary)
 {
     TracertlPcTagSidecarWriter *writer;
 
     writer = g_new0(TracertlPcTagSidecarWriter, 1);
-    writer->fp = fopen(path, "w");
+    writer->fp = fopen(path, binary ? "wb" : "w");
     if (!writer->fp) {
         g_free(writer);
         return NULL;
     }
 
+    if (unbuffered) {
+        setvbuf(writer->fp, NULL, _IONBF, 0);
+    } else {
+        setvbuf(writer->fp, NULL, _IOFBF, 1024 * 1024);
+    }
+    writer->binary = binary;
     writer->seen_pcs = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                              g_free, NULL);
-    if (fprintf(writer->fp,
-                "# trace_pc_start,trace_pc_end,tag\n"
-                "# sidecar_mode=ordinal\n") < 0) {
+    if (binary) {
+        TracertlPcTagSidecarBinaryHeader header = {
+            .magic = TRACERTL_PC_TAG_SIDECAR_BINARY_MAGIC,
+            .version = TRACERTL_PC_TAG_SIDECAR_BINARY_VERSION,
+            .mode = TRACERTL_PC_TAG_SIDECAR_MODE_ORDINAL,
+            .reserved = 0,
+        };
+        if (fwrite(&header, sizeof(header), 1, writer->fp) != 1) {
+            g_hash_table_destroy(writer->seen_pcs);
+            fclose(writer->fp);
+            g_free(writer);
+            return NULL;
+        }
+    } else if (fprintf(writer->fp,
+                       "# trace_pc_start,trace_pc_end,tag\n"
+                       "# sidecar_mode=ordinal\n") < 0) {
         g_hash_table_destroy(writer->seen_pcs);
         fclose(writer->fp);
         g_free(writer);
@@ -91,6 +140,23 @@ static inline TracertlPcTagSidecarWriter *tracertl_pc_tag_sidecar_open(
     }
 
     return writer;
+}
+
+static inline TracertlPcTagSidecarWriter *tracertl_pc_tag_sidecar_open_mode(
+    const char *path, bool unbuffered)
+{
+    return tracertl_pc_tag_sidecar_open_format(path, unbuffered, false);
+}
+
+static inline TracertlPcTagSidecarWriter *tracertl_pc_tag_sidecar_open_binary_mode(
+    const char *path, bool unbuffered)
+{
+    return tracertl_pc_tag_sidecar_open_format(path, unbuffered, true);
+}
+
+static inline TracertlPcTagSidecarWriter *tracertl_pc_tag_sidecar_open(const char *path)
+{
+    return tracertl_pc_tag_sidecar_open_mode(path, false);
 }
 
 static inline int tracertl_pc_tag_sidecar_note(

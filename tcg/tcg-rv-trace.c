@@ -1920,6 +1920,15 @@ static void rv_backend_out_call(TCGContext *s, const tcg_insn_unit *target,
     bool is_aarch64_guest = rv_target_is_aarch64_guest();
     bool is_system_emulation = rv_target_is_system_emulation();
 
+    /* Plugin calls use a template TCGHelperInfo with a different function
+     * pointer (the same distinction used by tcg_dump_ops). They must never
+     * replace guest semantics or suppress subsequent guest temp definitions.
+     */
+    if (info != NULL && (const void *)target != info->func) {
+        rv_backend_emit_helper_slot(s);
+        return;
+    }
+
     if (!rv_target_is_native_riscv_guest()) {
         copy_size = rv_trace_copy_current_guest_bytes(bytes, sizeof(bytes));
         if (counter_name == NULL) {
@@ -3979,9 +3988,10 @@ static const TCGCodeGenOps rv_trace_codegen_ops = {
 static int tcg_tb_emit_rv_tagged_live(uint32_t *buf, uint8_t *tags, int buf_size,
                                       int *insn_offsets,
                                       qemu_plugin_rv_insn_meta *insn_meta,
-                                      int *n_guest_insns)
+                                      int *n_guest_insns, int *unwind)
 {
     TCGContext *s = tcg_ctx;
+    sigjmp_buf saved_jmp;
     RvTempMapState temp_map;
     RvTempMapState *saved_temp_map = rv_temp_map_state;
     uint8_t *saved_emit_tags = rv_emit_tags;
@@ -4022,14 +4032,25 @@ static int tcg_tb_emit_rv_tagged_live(uint32_t *buf, uint8_t *tags, int buf_size
     rv_current_tag = QEMU_PLUGIN_RV_TAG_NONE;
     rv_trace_build_state = &state;
     rv_trace_backend_prepare(s);
-    ret = tcg_gen_code_common(s, NULL, &rv_trace_codegen_ops);
+    /* Frame exhaustion must not bypass the temporary backend's cleanup.
+     * Return the unwind code to the owner of the allocator snapshot; it
+     * restores host state and frees trace buffers before propagating it.
+     */
+    memcpy(saved_jmp, s->jmp_trans, sizeof(saved_jmp));
+    *unwind = sigsetjmp(s->jmp_trans, 0);
+    if (*unwind == 0) {
+        ret = tcg_gen_code_common(s, NULL, &rv_trace_codegen_ops);
+    } else {
+        ret = -1;
+    }
+    memcpy(s->jmp_trans, saved_jmp, sizeof(saved_jmp));
     rv_trace_build_state = saved_build_state;
 
     rv_emit_tags = saved_emit_tags;
     rv_temp_map_state = saved_temp_map;
     rv_current_tag = saved_tag;
     rv_current_origin = saved_origin;
-    *n_guest_insns = state.n_guest_insns;
+    *n_guest_insns = *unwind ? 0 : state.n_guest_insns;
     return ret;
 }
 
@@ -4210,6 +4231,7 @@ int tcg_tb_emit_rv_tagged(uint32_t *buf, uint8_t *tags, int buf_size,
 {
     TCGContext *s = tcg_ctx;
     RvTraceAllocSnapshot snapshot;
+    int unwind = 0;
     int ret;
 
     if (!s || QTAILQ_EMPTY(&s->ops)) {
@@ -4220,9 +4242,12 @@ int tcg_tb_emit_rv_tagged(uint32_t *buf, uint8_t *tags, int buf_size,
     rv_trace_snapshot_save(s, &snapshot);
     ret = tcg_tb_emit_rv_tagged_live(buf, tags, buf_size,
                                      insn_offsets, insn_meta,
-                                     n_guest_insns);
+                                     n_guest_insns, &unwind);
     rv_trace_snapshot_restore(s, &snapshot);
     g_free(snapshot.temps);
+    if (unwind) {
+        siglongjmp(s->jmp_trans, unwind);
+    }
     return ret;
 }
 
@@ -4330,6 +4355,7 @@ void tcg_plugin_tb_build_rv_trace(TCGContext *s, TranslationBlock *tb)
     int total_rv = 0;
     int filtered_total_rv = 0;
     int n_guest = 0;
+    int unwind = 0;
 
     (void)tb;
 
@@ -4361,8 +4387,11 @@ void tcg_plugin_tb_build_rv_trace(TCGContext *s, TranslationBlock *tb)
         rv_trace_snapshot_restore(s, &snapshot);
         rv_emit_origins = rv_origins;
         total_rv = tcg_tb_emit_rv_tagged_live(rv_buf, rv_tags, (int)buf_size,
-                                              offsets, meta, &n_guest);
+                                              offsets, meta, &n_guest, &unwind);
         rv_emit_origins = NULL;
+        if (unwind) {
+            goto out;
+        }
         if (total_rv >= 0) {
             break;
         }
@@ -4421,4 +4450,7 @@ out:
     g_free(meta);
     g_free(filtered_offsets);
     g_free(filtered_meta);
+    if (unwind) {
+        siglongjmp(s->jmp_trans, unwind);
+    }
 }

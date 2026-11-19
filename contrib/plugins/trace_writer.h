@@ -18,12 +18,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <zstd.h>
 
 #include "trace_format_c.h"
 
 /* Buffer size for accumulating records before compression */
-#define TRACE_WRITER_BUF_RECORDS 1024
+#define TRACE_WRITER_BUF_RECORDS 65536
 #define TRACE_WRITER_BUF_SIZE \
     (TRACE_WRITER_BUF_RECORDS * sizeof(struct TraceInstructionC))
 
@@ -31,6 +32,7 @@ typedef struct {
     FILE *fp;
     ZSTD_CCtx *cctx;
     ZSTD_CStream *cstream;
+    bool raw;
 
     /* Input buffer: accumulate raw records */
     uint8_t *in_buf;
@@ -59,20 +61,23 @@ static inline TraceWriter *trace_writer_open(const char *path, int level)
         return NULL;
     }
 
-    tw->cstream = ZSTD_createCStream();
-    if (!tw->cstream) {
-        fclose(tw->fp);
-        free(tw);
-        return NULL;
-    }
+    tw->raw = (level == 0);
+    if (!tw->raw) {
+        tw->cstream = ZSTD_createCStream();
+        if (!tw->cstream) {
+            fclose(tw->fp);
+            free(tw);
+            return NULL;
+        }
 
-    size_t ret = ZSTD_CCtx_setParameter(tw->cstream, ZSTD_c_compressionLevel,
-                                        level);
-    if (ZSTD_isError(ret)) {
-        ZSTD_freeCStream(tw->cstream);
-        fclose(tw->fp);
-        free(tw);
-        return NULL;
+        size_t ret = ZSTD_CCtx_setParameter(tw->cstream, ZSTD_c_compressionLevel,
+                                            level);
+        if (ZSTD_isError(ret)) {
+            ZSTD_freeCStream(tw->cstream);
+            fclose(tw->fp);
+            free(tw);
+            return NULL;
+        }
     }
 
     tw->in_capacity = TRACE_WRITER_BUF_SIZE;
@@ -94,6 +99,14 @@ static inline TraceWriter *trace_writer_open(const char *path, int level)
 static inline int trace_writer_flush(TraceWriter *tw)
 {
     if (tw->in_pos == 0) {
+        return 0;
+    }
+
+    if (tw->raw) {
+        if (fwrite(tw->in_buf, 1, tw->in_pos, tw->fp) != tw->in_pos) {
+            return -1;
+        }
+        tw->in_pos = 0;
         return 0;
     }
 
@@ -151,7 +164,7 @@ static inline int trace_writer_close(TraceWriter *tw)
     }
 
     /* End the Zstd stream, draining all buffered footer output. */
-    while (result == 0) {
+    while (!tw->raw && result == 0) {
         ZSTD_outBuffer output = { tw->out_buf, tw->out_capacity, 0 };
         ZSTD_inBuffer input = { NULL, 0, 0 };
         size_t ret = ZSTD_compressStream2(tw->cstream, &output, &input,
@@ -171,7 +184,9 @@ static inline int trace_writer_close(TraceWriter *tw)
         }
     }
 
-    ZSTD_freeCStream(tw->cstream);
+    if (tw->cstream) {
+        ZSTD_freeCStream(tw->cstream);
+    }
     if (fclose(tw->fp) != 0) {
         result = -1;
     }

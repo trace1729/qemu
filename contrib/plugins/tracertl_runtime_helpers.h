@@ -15,6 +15,15 @@ uint32_t tracertl_guest_semantic_stub_insn(const uint8_t *bytes,
                                            uint8_t guest_branch_type,
                                            uint8_t guest_exception_code,
                                            bool *designate_mem_slot);
+uint32_t tracertl_guest_conditional_branch_placeholder(bool branch_taken);
+uint32_t tracertl_guest_non_branch_placeholder(void);
+bool tracertl_demote_branch_if_sequential(struct TraceInstructionC *branch_rec,
+                                          uint64_t sequential_target);
+bool tracertl_rv_encode_branch_to_target(uint64_t pc, uint64_t target,
+                                         bool branch_taken,
+                                         uint32_t *insn);
+bool tracertl_rv_encode_jal_to_target(uint64_t pc, uint64_t target,
+                                      uint32_t *insn);
 uint8_t tracertl_riscv_mem_type(uint32_t insn, uint8_t fallback_type);
 void tracertl_init_overflow_memory_record(struct TraceInstructionC *dst,
                                           const struct TraceInstructionC *template_rec,

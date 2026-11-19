@@ -43,6 +43,85 @@ bool tracertl_rv_buf_grow(size_t *buf_size)
     return true;
 }
 
+uint32_t tracertl_guest_conditional_branch_placeholder(bool branch_taken)
+{
+    return branch_taken ? 0x00000063U  /* beq x0, x0, 0 */
+                        : 0x00001063U; /* bne x0, x0, 0 */
+}
+
+uint32_t tracertl_guest_non_branch_placeholder(void)
+{
+    return 0x01e080b3U; /* add x1, x1, x30 */
+}
+
+bool tracertl_demote_branch_if_sequential(struct TraceInstructionC *branch_rec,
+                                          uint64_t sequential_target)
+{
+    g_assert(branch_rec != NULL);
+
+    if (branch_rec->branch_type == 0 ||
+        branch_rec->branch_taken == 0 ||
+        branch_rec->target == 0 ||
+        branch_rec->target != sequential_target) {
+        return false;
+    }
+
+    branch_rec->instr = tracertl_guest_non_branch_placeholder();
+    branch_rec->branch_type = 0;
+    branch_rec->branch_taken = 0;
+    branch_rec->target = 0;
+    return true;
+}
+
+bool tracertl_rv_encode_branch_to_target(uint64_t pc, uint64_t target,
+                                         bool branch_taken,
+                                         uint32_t *insn)
+{
+    int64_t delta;
+    uint32_t imm;
+    uint32_t funct3;
+
+    g_assert(insn != NULL);
+
+    delta = (int64_t)(target - pc);
+    if ((delta & 1) != 0 || delta < -4096 || delta > 4094) {
+        return false;
+    }
+
+    imm = (uint32_t)delta & 0x1fffU;
+    funct3 = branch_taken ? 0x0U : 0x1U; /* beq/bne x0, x0 */
+    *insn = ((imm >> 12) & 0x1U) << 31 |
+            ((imm >> 5) & 0x3fU) << 25 |
+            funct3 << 12 |
+            ((imm >> 1) & 0xfU) << 8 |
+            ((imm >> 11) & 0x1U) << 7 |
+            0x63U;
+    return true;
+}
+
+bool tracertl_rv_encode_jal_to_target(uint64_t pc, uint64_t target,
+                                      uint32_t *insn)
+{
+    int64_t delta;
+    uint32_t imm;
+
+    g_assert(insn != NULL);
+
+    delta = (int64_t)(target - pc);
+    if ((delta & 1) != 0 || delta < -(INT64_C(1) << 20) ||
+        delta > ((INT64_C(1) << 20) - 2)) {
+        return false;
+    }
+
+    imm = (uint32_t)delta & 0x1fffffU;
+    *insn = ((imm >> 20) & 0x1U) << 31 |
+            ((imm >> 1) & 0x3ffU) << 21 |
+            ((imm >> 11) & 0x1U) << 20 |
+            ((imm >> 12) & 0xffU) << 12 |
+            0x6fU; /* jal x0, imm */
+    return true;
+}
+
 uint32_t tracertl_guest_semantic_stub_insn(const uint8_t *bytes,
                                            size_t len,
                                            bool is_x86_guest,
@@ -65,7 +144,7 @@ uint32_t tracertl_guest_semantic_stub_insn(const uint8_t *bytes,
 
     switch (guest_branch_type) {
     case 1:
-        return 0x00000063U;
+        return tracertl_guest_conditional_branch_placeholder(true);
     case 2:
         return 0x0000006fU;
     case 3:
